@@ -1,8 +1,20 @@
 package com.example.smartrecipeassistant
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -14,6 +26,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -24,6 +37,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -37,6 +51,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
@@ -48,9 +65,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlin.math.abs
 import kotlin.math.roundToInt
-import kotlin.random.Random
 
 // ============================================================================
 // ENTRY POINT & THEME
@@ -113,8 +128,8 @@ data class Recipe(
     val name: String,
     val cuisine: String,
     val category: String,
-    val prepTime: Int, // minutes
-    val cookTime: Int, // minutes
+    val prepTime: Int,
+    val cookTime: Int,
     val servings: Int,
     val difficulty: String,
     val imageUrl: String,
@@ -135,12 +150,16 @@ data class Ingredient(
 // ============================================================================
 
 class RecipeViewModel : ViewModel() {
-    // In a production app, this would be backed by Room Database & WorkManager
     private val _recipes = MutableStateFlow(getMockRecipes())
     val recipes: StateFlow<List<Recipe>> = _recipes.asStateFlow()
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    private val _categories = MutableStateFlow(
+        listOf("All", "Breakfast", "Dinner", "Healthy", "Dessert", "Quick")
+    )
+    val categories: StateFlow<List<String>> = _categories.asStateFlow()
 
     private val _pantry = MutableStateFlow(listOf("Salt", "Pepper", "Olive Oil", "Milk"))
     val pantry: StateFlow<List<String>> = _pantry.asStateFlow()
@@ -155,7 +174,22 @@ class RecipeViewModel : ViewModel() {
         }
     }
 
-    // Dynamic Compliments for Completion Screen
+    fun addRecipe(recipe: Recipe) {
+        _recipes.value = _recipes.value + recipe
+    }
+
+    fun addCategory(name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isNotEmpty() && _categories.value.none { it.equals(trimmed, ignoreCase = true) }) {
+            _categories.value = _categories.value + trimmed
+        }
+    }
+
+    fun removeCategory(name: String) {
+        if (name == "All") return
+        _categories.value = _categories.value.filterNot { it == name }
+    }
+
     val completionMessages = listOf(
         "Your kitchen must smell incredible right now.",
         "That aroma says dinner is almost ready.",
@@ -169,41 +203,95 @@ class RecipeViewModel : ViewModel() {
 }
 
 // ============================================================================
+// NOTIFICATION & SOUND HELPERS (for the cooking timer)
+// ============================================================================
+
+private const val TIMER_CHANNEL_ID = "timer_channel"
+private const val TIMER_NOTIFICATION_ID = 1001
+
+fun createTimerNotificationChannel(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val channel = NotificationChannel(
+            TIMER_CHANNEL_ID,
+            "Cooking Timer",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Alerts you when a cooking timer finishes"
+        }
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.createNotificationChannel(channel)
+    }
+}
+
+@SuppressLint("MissingPermission")
+fun showTimerFinishedNotification(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    ) {
+        return
+    }
+    val notification = NotificationCompat.Builder(context, TIMER_CHANNEL_ID)
+        .setSmallIcon(android.R.drawable.ic_popup_reminder)
+        .setContentTitle("Timer finished!")
+        .setContentText("Your dish needs attention — swipe up on the step once you're done.")
+        .setOngoing(true)
+        .setAutoCancel(false)
+        .setPriority(NotificationCompat.PRIORITY_HIGH)
+        .build()
+    NotificationManagerCompat.from(context).notify(TIMER_NOTIFICATION_ID, notification)
+}
+
+fun dismissTimerNotification(context: Context) {
+    NotificationManagerCompat.from(context).cancel(TIMER_NOTIFICATION_ID)
+}
+
+fun playTimerBeep() {
+    try {
+        val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+        toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
+    } catch (e: Exception) {
+        // Some devices don't support tone generation — fail silently
+    }
+}
+
+// ============================================================================
 // NAVIGATION & ROOT APP
 // ============================================================================
 
 @Composable
 fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
     val navController = rememberNavController()
-    
-    // Dynamic Unsplash Background Management
+
     val currentRoute = navController.currentBackStackEntryFlow.collectAsState(initial = null).value?.destination?.route
-    val backgroundCategory = when {
-        currentRoute?.startsWith("cooking") == true -> "cooking,ingredients"
-        currentRoute == "home" -> "kitchen,interior"
-        else -> "food,dark"
+    val backgroundSeed = when {
+        currentRoute?.startsWith("cooking") == true -> "cookingphase"
+        currentRoute == "home" -> "kitcheninterior"
+        currentRoute == "splash" -> "warmkitchen"
+        currentRoute == "add_recipe" -> "freshingredients"
+        else -> "fooddark"
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // App-wide Dynamic Background
         AsyncImage(
             model = ImageRequest.Builder(LocalContext.current)
-                .data("https://source.unsplash.com/featured/?$backgroundCategory")
+                .data("https://picsum.photos/seed/$backgroundSeed/1080/1920")
                 .crossfade(true)
                 .build(),
             contentDescription = "Background",
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize()
         )
-        // Overlay to ensure text readability
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background.copy(alpha = 0.90f))
+                .background(MaterialTheme.colorScheme.background.copy(alpha = 0.65f))
         )
+        DecorativeBackground()
 
-        NavHost(navController = navController, startDestination = "home") {
+        NavHost(navController = navController, startDestination = "splash") {
+            composable("splash") { SplashScreen(navController) }
             composable("home") { HomeScreen(navController, viewModel) }
+            composable("add_recipe") { AddRecipeScreen(navController, viewModel) }
             composable("recipe/{id}") { backStackEntry ->
                 val id = backStackEntry.arguments?.getString("id")
                 val recipe = viewModel.recipes.value.find { it.id == id }
@@ -230,6 +318,100 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 }
 
 // ============================================================================
+// SPLASH SCREEN
+// ============================================================================
+
+@Composable
+fun SplashScreen(navController: NavController) {
+    val greetings = remember {
+        listOf(
+            "Good to see you, Yan. What shall we cook today?",
+            "Welcome back, Yan — the kitchen has been waiting for you.",
+            "Hello, Yan. Let's create something wonderful together.",
+            "It's always a pleasure, Yan. Ready when you are.",
+            "Yan, your next delicious creation awaits."
+        )
+    }
+    val message = remember { greetings.random() }
+
+    LaunchedEffect(Unit) {
+        delay(2200)
+        navController.navigate("home") {
+            popUpTo("splash") { inclusive = true }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.background)
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
+            Text("🍲", fontSize = 56.sp)
+            Spacer(modifier = Modifier.height(20.dp))
+            Text(
+                message,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+// ============================================================================
+// DECORATIVE BACKGROUND ACCENTS
+// ============================================================================
+
+@Composable
+fun DecorativeBackground() {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .size(260.dp)
+                .align(Alignment.TopStart)
+                .offset(x = (-60).dp, y = (-40).dp)
+                .background(
+                    Brush.radialGradient(
+                        colors = listOf(MaterialTheme.colorScheme.primary.copy(alpha = 0.35f), Color.Transparent)
+                    ),
+                    shape = CircleShape
+                )
+        )
+        Box(
+            modifier = Modifier
+                .size(320.dp)
+                .align(Alignment.TopEnd)
+                .offset(x = 80.dp, y = 480.dp)
+                .background(
+                    Brush.radialGradient(
+                        colors = listOf(MaterialTheme.colorScheme.secondary.copy(alpha = 0.30f), Color.Transparent)
+                    ),
+                    shape = CircleShape
+                )
+        )
+        Box(
+            modifier = Modifier
+                .size(220.dp)
+                .align(Alignment.BottomStart)
+                .offset(x = (-40).dp, y = 60.dp)
+                .background(
+                    Brush.radialGradient(
+                        colors = listOf(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f), Color.Transparent)
+                    ),
+                    shape = CircleShape
+                )
+        )
+    }
+}
+
+// ============================================================================
 // HOME SCREEN
 // ============================================================================
 
@@ -237,12 +419,29 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 fun HomeScreen(navController: NavController, viewModel: RecipeViewModel) {
     val recipes by viewModel.recipes.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
+    val categories by viewModel.categories.collectAsState()
+    var selectedCategory by remember { mutableStateOf("All") }
+    var showCategoryDialog by remember { mutableStateOf(false) }
+
+    val filteredRecipes = remember(recipes, searchQuery, selectedCategory) {
+        recipes.filter { recipe ->
+            val matchesCategory = selectedCategory == "All" ||
+                recipe.category.equals(selectedCategory, ignoreCase = true)
+            val query = searchQuery.trim()
+            val matchesSearch = query.isEmpty() ||
+                recipe.name.contains(query, ignoreCase = true) ||
+                recipe.cuisine.contains(query, ignoreCase = true) ||
+                recipe.category.contains(query, ignoreCase = true) ||
+                recipe.ingredients.any { it.name.contains(query, ignoreCase = true) }
+            matchesCategory && matchesSearch
+        }
+    }
 
     Scaffold(
         containerColor = Color.Transparent,
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { /* TODO: Navigate to Create Recipe */ },
+                onClick = { navController.navigate("add_recipe") },
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary
             ) {
@@ -257,39 +456,73 @@ fun HomeScreen(navController: NavController, viewModel: RecipeViewModel) {
             item {
                 HomeHeader(searchQuery) { viewModel.updateSearch(it) }
             }
-            
-            item { CategoryRow() }
+
+            item {
+                CategoryRow(
+                    categories = categories,
+                    selectedCategory = selectedCategory,
+                    onCategorySelected = { selectedCategory = it },
+                    onManageCategories = { showCategoryDialog = true }
+                )
+            }
 
             item {
                 Text(
-                    "Recently Opened",
+                    text = if (searchQuery.isNotBlank() || selectedCategory != "All") "Results" else "Recently Opened",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
 
-            items(recipes.chunked(2)) { rowRecipes ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    for (recipe in rowRecipes) {
-                        RecipeCard(
-                            recipe = recipe,
-                            modifier = Modifier.weight(1f),
-                            onClick = { navController.navigate("recipe/${recipe.id}") },
-                            onFavoriteClick = { viewModel.toggleFavorite(recipe.id) }
+            if (filteredRecipes.isEmpty()) {
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("🔍", fontSize = 40.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "No recipes match your search.",
+                            color = Color.Gray,
+                            textAlign = TextAlign.Center
                         )
                     }
-                    // Fill empty space if odd number
-                    if (rowRecipes.size == 1) Spacer(modifier = Modifier.weight(1f))
                 }
-                Spacer(modifier = Modifier.height(12.dp))
+            } else {
+                items(filteredRecipes.chunked(2)) { rowRecipes ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        for (recipe in rowRecipes) {
+                            RecipeCard(
+                                recipe = recipe,
+                                modifier = Modifier.weight(1f),
+                                onClick = { navController.navigate("recipe/${recipe.id}") },
+                                onFavoriteClick = { viewModel.toggleFavorite(recipe.id) }
+                            )
+                        }
+                        if (rowRecipes.size == 1) Spacer(modifier = Modifier.weight(1f))
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
             }
         }
+    }
+
+    if (showCategoryDialog) {
+        CategoryManagerDialog(
+            categories = categories,
+            onAdd = { viewModel.addCategory(it) },
+            onRemove = { viewModel.removeCategory(it) },
+            onDismiss = { showCategoryDialog = false }
+        )
     }
 }
 
@@ -320,8 +553,12 @@ fun HomeHeader(searchQuery: String, onSearchChange: (String) -> Unit) {
 }
 
 @Composable
-fun CategoryRow() {
-    val categories = listOf("All", "Breakfast", "Dinner", "Healthy", "Dessert", "Quick")
+fun CategoryRow(
+    categories: List<String>,
+    selectedCategory: String,
+    onCategorySelected: (String) -> Unit,
+    onManageCategories: () -> Unit
+) {
     LazyRow(
         contentPadding = PaddingValues(horizontal = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -330,9 +567,9 @@ fun CategoryRow() {
         items(categories) { cat ->
             Surface(
                 shape = RoundedCornerShape(20.dp),
-                color = if (cat == "All") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                contentColor = if (cat == "All") Color.White else MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.clickable { /* Select category */ },
+                color = if (cat == selectedCategory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                contentColor = if (cat == selectedCategory) Color.White else MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.clickable { onCategorySelected(cat) },
                 shadowElevation = 2.dp
             ) {
                 Text(
@@ -342,7 +579,75 @@ fun CategoryRow() {
                 )
             }
         }
+        item {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.clickable { onManageCategories() },
+                shadowElevation = 2.dp
+            ) {
+                Icon(
+                    Icons.Default.Edit,
+                    contentDescription = "Manage categories",
+                    modifier = Modifier
+                        .padding(10.dp)
+                        .size(18.dp)
+                )
+            }
+        }
     }
+}
+
+@Composable
+fun CategoryManagerDialog(
+    categories: List<String>,
+    onAdd: (String) -> Unit,
+    onRemove: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var newCategoryText by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Manage Categories") },
+        text = {
+            Column {
+                categories.filter { it != "All" }.forEach { cat ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(cat)
+                        IconButton(onClick = { onRemove(cat) }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Remove $cat")
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = newCategoryText,
+                        onValueChange = { newCategoryText = it },
+                        placeholder = { Text("New category") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    TextButton(onClick = {
+                        if (newCategoryText.isNotBlank()) {
+                            onAdd(newCategoryText.trim())
+                            newCategoryText = ""
+                        }
+                    }) { Text("Add") }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Done") }
+        }
+    )
 }
 
 @Composable
@@ -456,8 +761,7 @@ fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: 
                 Column(modifier = Modifier.padding(24.dp)) {
                     Text(recipe.name, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.ExtraBold)
                     Spacer(modifier = Modifier.height(8.dp))
-                    
-                    // Stats Row
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -504,16 +808,264 @@ fun StatBox(icon: ImageVector, label: String, value: String) {
 }
 
 // ============================================================================
+// ADD RECIPE SCREEN
+// ============================================================================
+
+class IngredientFormRow(name: String = "", quantity: String = "") {
+    var name by mutableStateOf(name)
+    var quantity by mutableStateOf(quantity)
+}
+
+class StepFormRow(text: String = "") {
+    var text by mutableStateOf(text)
+}
+
+@Composable
+fun AddRecipeScreen(navController: NavController, viewModel: RecipeViewModel) {
+    val categories by viewModel.categories.collectAsState()
+    val selectableCategories = categories.filter { it != "All" }
+
+    var name by remember { mutableStateOf("") }
+    var selectedCategory by remember { mutableStateOf(selectableCategories.firstOrNull() ?: "Dinner") }
+    var newCategoryText by remember { mutableStateOf("") }
+    var prepTime by remember { mutableStateOf("10") }
+    var cookTime by remember { mutableStateOf("15") }
+    var servings by remember { mutableStateOf("2") }
+    var difficulty by remember { mutableStateOf("Easy") }
+
+    val ingredientRows = remember { mutableStateListOf(IngredientFormRow()) }
+    val stepRows = remember { mutableStateListOf(StepFormRow()) }
+
+    Scaffold(containerColor = Color.Transparent) { padding ->
+        LazyColumn(
+            contentPadding = padding,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 20.dp)
+        ) {
+            item {
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                    Text("New Recipe", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Recipe name") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text("Category", fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(selectableCategories) { cat ->
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = if (cat == selectedCategory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                            contentColor = if (cat == selectedCategory) Color.White else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.clickable { selectedCategory = cat }
+                        ) {
+                            Text(cat, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = newCategoryText,
+                        onValueChange = { newCategoryText = it },
+                        placeholder = { Text("Add a new category") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = {
+                        if (newCategoryText.isNotBlank()) {
+                            viewModel.addCategory(newCategoryText.trim())
+                            selectedCategory = newCategoryText.trim()
+                            newCategoryText = ""
+                        }
+                    }) { Text("Add") }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = prepTime,
+                        onValueChange = { prepTime = it.filter { c -> c.isDigit() } },
+                        label = { Text("Prep (min)") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = cookTime,
+                        onValueChange = { cookTime = it.filter { c -> c.isDigit() } },
+                        label = { Text("Cook (min)") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = servings,
+                        onValueChange = { servings = it.filter { c -> c.isDigit() } },
+                        label = { Text("Servings") },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Difficulty", fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Easy", "Medium", "Hard").forEach { level ->
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = if (level == difficulty) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.surface,
+                            contentColor = if (level == difficulty) Color.White else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.clickable { difficulty = level }
+                        ) {
+                            Text(level, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Ingredients", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    TextButton(onClick = { ingredientRows.add(IngredientFormRow()) }) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Add")
+                    }
+                }
+            }
+
+            items(ingredientRows) { row ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = row.name,
+                        onValueChange = { row.name = it },
+                        placeholder = { Text("Ingredient") },
+                        modifier = Modifier.weight(2f),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = row.quantity,
+                        onValueChange = { row.quantity = it },
+                        placeholder = { Text("Qty") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    IconButton(onClick = { ingredientRows.remove(row) }, enabled = ingredientRows.size > 1) {
+                        Icon(Icons.Default.Close, contentDescription = "Remove ingredient")
+                    }
+                }
+            }
+
+            item {
+                Spacer(modifier = Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Steps", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    TextButton(onClick = { stepRows.add(StepFormRow()) }) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Add")
+                    }
+                }
+            }
+
+            itemsIndexed(stepRows) { index, row ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("${index + 1}.", modifier = Modifier.padding(top = 16.dp))
+                    OutlinedTextField(
+                        value = row.text,
+                        onValueChange = { row.text = it },
+                        placeholder = { Text("Describe this step") },
+                        modifier = Modifier.weight(1f),
+                        minLines = 2
+                    )
+                    IconButton(onClick = { stepRows.remove(row) }, enabled = stepRows.size > 1) {
+                        Icon(Icons.Default.Close, contentDescription = "Remove step")
+                    }
+                }
+            }
+
+            item {
+                Spacer(modifier = Modifier.height(28.dp))
+                Button(
+                    onClick = {
+                        val finalIngredients = ingredientRows
+                            .filter { it.name.isNotBlank() }
+                            .map { Ingredient(it.name.trim(), it.quantity.ifBlank { "as needed" }) }
+                        val finalSteps = stepRows
+                            .map { it.text.trim() }
+                            .filter { it.isNotBlank() }
+
+                        if (name.isNotBlank() && finalIngredients.isNotEmpty() && finalSteps.isNotEmpty()) {
+                            val newRecipe = Recipe(
+                                id = "recipe_${System.currentTimeMillis()}",
+                                name = name.trim(),
+                                cuisine = selectedCategory,
+                                category = selectedCategory,
+                                prepTime = prepTime.toIntOrNull() ?: 10,
+                                cookTime = cookTime.toIntOrNull() ?: 15,
+                                servings = servings.toIntOrNull() ?: 2,
+                                difficulty = difficulty,
+                                imageUrl = "https://picsum.photos/seed/${Uri.encode(name.trim().filter { it.isLetterOrDigit() }.ifEmpty { "recipe" })}/800/600",
+                                ingredients = finalIngredients,
+                                steps = finalSteps
+                            )
+                            viewModel.addRecipe(newRecipe)
+                            navController.popBackStack()
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) {
+                    Text("Save Recipe", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+}
+
+// ============================================================================
 // PHASE 1: INGREDIENT GATHERING (NATIVE SWIPE PHYSICS)
 // ============================================================================
 
 @Composable
 fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
     var currentIndex by remember { mutableStateOf(0) }
-    val collectedIngredients = remember { mutableStateListOf<Ingredient>() }
+    val missingIngredients = remember { mutableStateListOf<Ingredient>() }
+    var confirmedGathered by remember { mutableStateOf(false) }
 
     if (currentIndex >= recipe.ingredients.size) {
-        // Confirmation View
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -521,21 +1073,63 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text("🛒", fontSize = 64.sp)
-            Spacer(modifier = Modifier.height(16.dp))
-            Text("Basket Confirmed!", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
-            Text("You collected ${collectedIngredients.size} items.", color = Color.Gray)
-            
-            Spacer(modifier = Modifier.height(32.dp))
+            if (missingIngredients.isEmpty()) {
+                Text("✅", fontSize = 64.sp)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    "You've got everything!",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    textAlign = TextAlign.Center
+                )
+                Text("No shopping needed — you're ready to cook.", color = Color.Gray, textAlign = TextAlign.Center)
+            } else {
+                Text("🛒", fontSize = 56.sp)
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("You still need to get:", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f, fill = false)
+                ) {
+                    missingIngredients.forEach { ing ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(ing.name, fontWeight = FontWeight.SemiBold)
+                            Text(ing.quantity, color = Color.Gray)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { confirmedGathered = !confirmedGathered },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(checked = confirmedGathered, onCheckedChange = { confirmedGathered = it })
+                    Text("I've gathered all of these already")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
             Button(
                 onClick = { navController.navigate("cooking_phase2/${recipe.id}") { popUpTo("home") } },
+                enabled = missingIngredients.isEmpty() || confirmedGathered,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(60.dp),
                 shape = RoundedCornerShape(20.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
             ) {
-                Text("Yes, Start Cooking!", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("Start Cooking!", fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
         }
         return
@@ -544,7 +1138,6 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
     val currentIngredient = recipe.ingredients[currentIndex]
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Header
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -552,7 +1145,12 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("Gather Ingredients", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Text("Swipe UP to collect • DOWN to discard", fontSize = 14.sp, color = Color.Gray)
+            Text(
+                "Swipe UP if you already have it • DOWN if you need to buy it",
+                fontSize = 14.sp,
+                color = Color.Gray,
+                textAlign = TextAlign.Center
+            )
             Text(
                 "ITEM ${currentIndex + 1} OF ${recipe.ingredients.size}",
                 color = MaterialTheme.colorScheme.primary,
@@ -562,7 +1160,6 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
             )
         }
 
-        // Swipeable Area
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -570,12 +1167,10 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
             contentAlignment = Alignment.Center
         ) {
             SwipeableCard(
-                key = currentIngredient.name, // Forces recomposition on new item
-                onSwipedUp = {
-                    collectedIngredients.add(currentIngredient)
-                    currentIndex++
-                },
+                key = currentIngredient.name,
+                onSwipedUp = { currentIndex++ },
                 onSwipedDown = {
+                    missingIngredients.add(currentIngredient)
                     currentIndex++
                 }
             ) {
@@ -601,7 +1196,6 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
             }
         }
 
-        // Basket UI
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -611,12 +1205,11 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
             contentAlignment = Alignment.BottomCenter
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(bottom = 16.dp)) {
-                // Chips
                 LazyRow(
                     modifier = Modifier.padding(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(collectedIngredients) { ing ->
+                    items(missingIngredients) { ing ->
                         Surface(
                             shape = CircleShape,
                             color = MaterialTheme.colorScheme.primaryContainer
@@ -631,7 +1224,7 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
                     }
                 }
                 Spacer(modifier = Modifier.height(16.dp))
-                Text("YOUR BASKET", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
+                Text("SHOPPING LIST", fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
             }
         }
     }
@@ -644,9 +1237,9 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
 @Composable
 fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completionMessages: List<String>) {
     var currentStepIndex by remember { mutableStateOf(0) }
+    val context = LocalContext.current
 
     if (currentStepIndex >= recipe.steps.size) {
-        // Done Screen
         val message = remember { completionMessages.random() }
         Column(
             modifier = Modifier
@@ -659,7 +1252,7 @@ fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completion
             Spacer(modifier = Modifier.height(24.dp))
             Text("Dish Complete!", style = MaterialTheme.typography.headlineLarge, color = Color.White, fontWeight = FontWeight.ExtraBold)
             Text(message, style = MaterialTheme.typography.titleMedium, color = Color.White.copy(alpha = 0.9f), textAlign = TextAlign.Center, modifier = Modifier.padding(32.dp))
-            
+
             Button(
                 onClick = { navController.navigate("home") { popUpTo(0) } },
                 colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = MaterialTheme.colorScheme.secondary),
@@ -700,8 +1293,11 @@ fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completion
         ) {
             SwipeableCard(
                 key = stepText,
-                swipeDownEnabled = false, // Only swipe up to proceed
-                onSwipedUp = { currentStepIndex++ },
+                swipeDownEnabled = false,
+                onSwipedUp = {
+                    dismissTimerNotification(context)
+                    currentStepIndex++
+                },
                 onSwipedDown = { }
             ) {
                 Column(
@@ -741,8 +1337,22 @@ fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completion
 fun TimerWidget(seconds: Int) {
     var timeRemaining by remember { mutableStateOf(seconds) }
     var isRunning by remember { mutableStateOf(false) }
-    
+
     val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* Timer still works even if the user declines */ }
+
+    LaunchedEffect(Unit) {
+        createTimerNotificationChannel(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     LaunchedEffect(isRunning) {
         if (isRunning) {
@@ -752,7 +1362,11 @@ fun TimerWidget(seconds: Int) {
             }
             isRunning = false
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-            // In a real app, trigger Notification/AlarmManager here
+            repeat(3) {
+                playTimerBeep()
+                delay(350)
+            }
+            showTimerFinishedNotification(context)
         }
     }
 
@@ -778,24 +1392,23 @@ fun TimerWidget(seconds: Int) {
             Text("TIMER DETECTED", fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 2.sp)
             Text(timeString, fontSize = 48.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(vertical = 8.dp))
             Text(
-                if (timeRemaining == 0) "Time's Up!" else if (isRunning) "Running..." else "Tap to start",
+                if (timeRemaining == 0) "Time's Up! Swipe up when ready." else if (isRunning) "Running..." else "Tap to start",
                 fontWeight = FontWeight.SemiBold
             )
         }
     }
 }
 
-// Regex Time Extractor
 fun extractTimeInSeconds(text: String): Int {
     val regex = Regex("(?:(\\d+)|(one|two|three|four|five|six|seven|eight|nine|ten))\\s*(minute|min|second|sec)s?", RegexOption.IGNORE_CASE)
     val match = regex.find(text) ?: return 0
-    
+
     val numStr = match.groupValues[1].ifEmpty { match.groupValues[2] }
     val unit = match.groupValues[3].lowercase()
-    
+
     val numMap = mapOf("one" to 1, "two" to 2, "three" to 3, "four" to 4, "five" to 5, "six" to 6, "seven" to 7, "eight" to 8, "nine" to 9, "ten" to 10)
     val num = numStr.toIntOrNull() ?: numMap[numStr.lowercase()] ?: 0
-    
+
     return if (unit.startsWith("min")) num * 60 else num
 }
 
@@ -812,15 +1425,15 @@ fun SwipeableCard(
     content: @Composable () -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
-    
-    // Animatable states for precise physics control
+
     val offsetY = remember(key) { Animatable(0f) }
     val rotateZ = remember(key) { Animatable(0f) }
     val scale = remember(key) { Animatable(1f) }
+    val alpha = remember(key) { Animatable(1f) }
     val scope = rememberCoroutineScope()
 
-    val screenHeight = 2000f // Arbitrary large boundary for throw off-screen
-    val swipeThreshold = 300f // Pixels required to commit to a swipe
+    val screenHeight = 2000f
+    val swipeThreshold = 300f
 
     Card(
         modifier = Modifier
@@ -831,27 +1444,27 @@ fun SwipeableCard(
                 rotationZ = rotateZ.value
                 scaleX = scale.value
                 scaleY = scale.value
+                this.alpha = alpha.value
             }
             .pointerInput(key) {
                 detectDragGestures(
                     onDragEnd = {
                         scope.launch {
                             if (offsetY.value < -swipeThreshold) {
-                                // Swipe UP Commit
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 launch { rotateZ.animateTo(15f, tween(300)) }
                                 launch { scale.animateTo(0.5f, tween(300)) }
                                 offsetY.animateTo(-screenHeight, tween(300, easing = FastOutLinearInEasing))
                                 onSwipedUp()
                             } else if (swipeDownEnabled && offsetY.value > swipeThreshold) {
-                                // Swipe DOWN Commit
+                                // Swipe DOWN — shrinks and fades toward the basket below
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                launch { rotateZ.animateTo(-15f, tween(300)) }
-                                launch { scale.animateTo(0.8f, tween(300)) }
-                                offsetY.animateTo(screenHeight, tween(300, easing = FastOutLinearInEasing))
+                                launch { rotateZ.animateTo(-20f, tween(350)) }
+                                launch { scale.animateTo(0.1f, tween(350, easing = FastOutLinearInEasing)) }
+                                launch { alpha.animateTo(0f, tween(350)) }
+                                offsetY.animateTo(650f, tween(350, easing = FastOutLinearInEasing))
                                 onSwipedDown()
                             } else {
-                                // Snap back with Spring Physics
                                 launch { rotateZ.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy)) }
                                 offsetY.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow))
                             }
@@ -861,11 +1474,8 @@ fun SwipeableCard(
                         change.consume()
                         scope.launch {
                             val newY = offsetY.value + dragAmount.y
-                            // Add resistance to drag
                             val resistance = if (newY < 0 || (newY > 0 && swipeDownEnabled)) 1f else 0.3f
                             offsetY.snapTo(offsetY.value + (dragAmount.y * resistance))
-                            
-                            // Slight rotation based on drag
                             rotateZ.snapTo(offsetY.value * 0.02f)
                         }
                     }
@@ -893,7 +1503,7 @@ fun getMockRecipes(): List<Recipe> {
             cookTime = 15,
             servings = 4,
             difficulty = "Easy",
-            imageUrl = "https://images.unsplash.com/photo-1518977676601-b53f82aba655?q=80&w=800", // Unsplash static demo
+            imageUrl = "https://images.unsplash.com/photo-1518977676601-b53f82aba655?q=80&w=800",
             ingredients = listOf(
                 Ingredient("Large Potatoes", "4 pcs"),
                 Ingredient("Whole Milk", "1/2 cup"),
