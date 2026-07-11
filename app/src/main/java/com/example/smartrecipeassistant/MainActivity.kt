@@ -2,6 +2,7 @@ package com.example.smartrecipeassistant
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
@@ -54,17 +55,23 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import androidx.navigation.compose.*
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.math.roundToInt
 
 // ============================================================================
@@ -146,23 +153,166 @@ data class Ingredient(
 )
 
 // ============================================================================
-// VIEW MODEL (Presentation & State Management)
+// JSON PERSISTENCE HELPERS (org.json — built into Android, no new dependency)
 // ============================================================================
 
-class RecipeViewModel : ViewModel() {
-    private val _recipes = MutableStateFlow(getMockRecipes())
+fun recipeToJson(recipe: Recipe): JSONObject {
+    val obj = JSONObject()
+    obj.put("id", recipe.id)
+    obj.put("name", recipe.name)
+    obj.put("cuisine", recipe.cuisine)
+    obj.put("category", recipe.category)
+    obj.put("prepTime", recipe.prepTime)
+    obj.put("cookTime", recipe.cookTime)
+    obj.put("servings", recipe.servings)
+    obj.put("difficulty", recipe.difficulty)
+    obj.put("imageUrl", recipe.imageUrl)
+    obj.put("isFavorite", recipe.isFavorite)
+    obj.put("timesCooked", recipe.timesCooked)
+    val ingredientsArray = JSONArray()
+    recipe.ingredients.forEach { ing ->
+        val ingObj = JSONObject()
+        ingObj.put("name", ing.name)
+        ingObj.put("quantity", ing.quantity)
+        ingObj.put("isMissingFromPantry", ing.isMissingFromPantry)
+        ingredientsArray.put(ingObj)
+    }
+    obj.put("ingredients", ingredientsArray)
+    val stepsArray = JSONArray()
+    recipe.steps.forEach { stepsArray.put(it) }
+    obj.put("steps", stepsArray)
+    return obj
+}
+
+fun jsonToRecipe(obj: JSONObject): Recipe {
+    val ingredientsArray = obj.getJSONArray("ingredients")
+    val ingredients = (0 until ingredientsArray.length()).map { i ->
+        val ingObj = ingredientsArray.getJSONObject(i)
+        Ingredient(
+            name = ingObj.getString("name"),
+            quantity = ingObj.getString("quantity"),
+            isMissingFromPantry = ingObj.optBoolean("isMissingFromPantry", false)
+        )
+    }
+    val stepsArray = obj.getJSONArray("steps")
+    val steps = (0 until stepsArray.length()).map { stepsArray.getString(it) }
+    return Recipe(
+        id = obj.getString("id"),
+        name = obj.getString("name"),
+        cuisine = obj.getString("cuisine"),
+        category = obj.getString("category"),
+        prepTime = obj.getInt("prepTime"),
+        cookTime = obj.getInt("cookTime"),
+        servings = obj.getInt("servings"),
+        difficulty = obj.getString("difficulty"),
+        imageUrl = obj.getString("imageUrl"),
+        ingredients = ingredients,
+        steps = steps,
+        isFavorite = obj.optBoolean("isFavorite", false),
+        timesCooked = obj.optInt("timesCooked", 0)
+    )
+}
+
+fun recipesToJson(recipes: List<Recipe>): String {
+    val array = JSONArray()
+    recipes.forEach { array.put(recipeToJson(it)) }
+    return array.toString()
+}
+
+fun jsonToRecipes(json: String): List<Recipe> {
+    val array = JSONArray(json)
+    return (0 until array.length()).map { jsonToRecipe(array.getJSONObject(it)) }
+}
+
+fun stringListToJson(list: List<String>): String {
+    val array = JSONArray()
+    list.forEach { array.put(it) }
+    return array.toString()
+}
+
+fun jsonToStringList(json: String): List<String> {
+    val array = JSONArray(json)
+    return (0 until array.length()).map { array.getString(it) }
+}
+
+// ============================================================================
+// TIMER SOUND OPTIONS
+// ============================================================================
+
+enum class TimerSound(val label: String, val toneType: Int, val durationMs: Int) {
+    CLASSIC_BEEP("Classic Beep", ToneGenerator.TONE_PROP_BEEP, 200),
+    ALERT_CHIME("Alert Chime", ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 250),
+    SOFT_PING("Soft Ping", ToneGenerator.TONE_CDMA_ABBR_ALERT, 150),
+    URGENT_ALARM("Urgent Alarm", ToneGenerator.TONE_DTMF_1, 300)
+}
+
+// ============================================================================
+// VIEW MODEL (Presentation, State Management & Persistence)
+// ============================================================================
+
+private const val PREFS_NAME = "smart_recipe_prefs"
+private const val KEY_RECIPES = "recipes_json"
+private const val KEY_CATEGORIES = "categories_json"
+private const val KEY_USER_NAME = "user_name"
+private const val KEY_TIMER_SOUND = "timer_sound"
+
+class RecipeViewModel(application: Application) : AndroidViewModel(application) {
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private val _recipes = MutableStateFlow(loadRecipes())
     val recipes: StateFlow<List<Recipe>> = _recipes.asStateFlow()
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
-    private val _categories = MutableStateFlow(
-        listOf("All", "Breakfast", "Dinner", "Healthy", "Dessert", "Quick")
-    )
+    private val _categories = MutableStateFlow(loadCategories())
     val categories: StateFlow<List<String>> = _categories.asStateFlow()
+
+    private val _userName = MutableStateFlow(prefs.getString(KEY_USER_NAME, "") ?: "")
+    val userName: StateFlow<String> = _userName.asStateFlow()
+
+    private val _selectedTimerSound = MutableStateFlow(
+        TimerSound.values().find { it.name == prefs.getString(KEY_TIMER_SOUND, null) } ?: TimerSound.CLASSIC_BEEP
+    )
+    val selectedTimerSound: StateFlow<TimerSound> = _selectedTimerSound.asStateFlow()
 
     private val _pantry = MutableStateFlow(listOf("Salt", "Pepper", "Olive Oil", "Milk"))
     val pantry: StateFlow<List<String>> = _pantry.asStateFlow()
+
+    private fun loadRecipes(): List<Recipe> {
+        val json = prefs.getString(KEY_RECIPES, null)
+        return if (json != null) {
+            try {
+                jsonToRecipes(json)
+            } catch (e: Exception) {
+                getMockRecipes()
+            }
+        } else {
+            getMockRecipes()
+        }
+    }
+
+    private fun loadCategories(): List<String> {
+        val json = prefs.getString(KEY_CATEGORIES, null)
+        val defaults = listOf("All", "Breakfast", "Dinner", "Healthy", "Dessert", "Quick", "Drinks")
+        return if (json != null) {
+            try {
+                jsonToStringList(json)
+            } catch (e: Exception) {
+                defaults
+            }
+        } else {
+            defaults
+        }
+    }
+
+    private fun persistRecipes() {
+        prefs.edit().putString(KEY_RECIPES, recipesToJson(_recipes.value)).apply()
+    }
+
+    private fun persistCategories() {
+        prefs.edit().putString(KEY_CATEGORIES, stringListToJson(_categories.value)).apply()
+    }
 
     fun updateSearch(query: String) {
         _searchQuery.value = query
@@ -172,22 +322,41 @@ class RecipeViewModel : ViewModel() {
         _recipes.value = _recipes.value.map {
             if (it.id == recipeId) it.copy(isFavorite = !it.isFavorite) else it
         }
+        persistRecipes()
     }
 
     fun addRecipe(recipe: Recipe) {
         _recipes.value = _recipes.value + recipe
+        persistRecipes()
+    }
+
+    fun updateRecipe(recipe: Recipe) {
+        _recipes.value = _recipes.value.map { if (it.id == recipe.id) recipe else it }
+        persistRecipes()
     }
 
     fun addCategory(name: String) {
         val trimmed = name.trim()
         if (trimmed.isNotEmpty() && _categories.value.none { it.equals(trimmed, ignoreCase = true) }) {
             _categories.value = _categories.value + trimmed
+            persistCategories()
         }
     }
 
     fun removeCategory(name: String) {
         if (name == "All") return
         _categories.value = _categories.value.filterNot { it == name }
+        persistCategories()
+    }
+
+    fun setUserName(name: String) {
+        _userName.value = name
+        prefs.edit().putString(KEY_USER_NAME, name).apply()
+    }
+
+    fun setTimerSound(sound: TimerSound) {
+        _selectedTimerSound.value = sound
+        prefs.edit().putString(KEY_TIMER_SOUND, sound.name).apply()
     }
 
     val completionMessages = listOf(
@@ -245,12 +414,78 @@ fun dismissTimerNotification(context: Context) {
     NotificationManagerCompat.from(context).cancel(TIMER_NOTIFICATION_ID)
 }
 
-fun playTimerBeep() {
+fun playTimerBeep(sound: TimerSound) {
     try {
         val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-        toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
+        toneGenerator.startTone(sound.toneType, sound.durationMs)
     } catch (e: Exception) {
         // Some devices don't support tone generation — fail silently
+    }
+}
+
+// ============================================================================
+// UNSPLASH IMAGE FETCHING (with Picsum fallback)
+// ============================================================================
+
+suspend fun fetchUnsplashImageUrl(query: String, accessKey: String): String? = withContext(Dispatchers.IO) {
+    if (accessKey.isBlank()) return@withContext null
+    try {
+        val encodedQuery = Uri.encode(query)
+        val url = URL("https://api.unsplash.com/search/photos?query=$encodedQuery&per_page=1&orientation=squarish&client_id=$accessKey")
+        val connection = url.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 8000
+        connection.readTimeout = 8000
+        if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+            val response = connection.inputStream.bufferedReader().use { it.readText() }
+            connection.disconnect()
+            val json = JSONObject(response)
+            val results = json.optJSONArray("results")
+            if (results != null && results.length() > 0) {
+                val urls = results.getJSONObject(0).getJSONObject("urls")
+                val smallUrl = urls.optString("small", "")
+                val regularUrl = urls.optString("regular", "")
+                if (smallUrl.isNotEmpty()) smallUrl else if (regularUrl.isNotEmpty()) regularUrl else null
+            } else {
+                null
+            }
+        } else {
+            connection.disconnect()
+            null
+        }
+    } catch (e: Exception) {
+        null
+    }
+}
+
+@Composable
+fun SmartImage(
+    query: String,
+    fallbackSeed: String,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Crop
+) {
+    var resolvedUrl by remember(query) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(query) {
+        val fetched = fetchUnsplashImageUrl(query, BuildConfig.UNSPLASH_ACCESS_KEY)
+        val safeSeed = fallbackSeed.filter { it.isLetterOrDigit() }.ifEmpty { "food" }
+        resolvedUrl = fetched ?: "https://picsum.photos/seed/${Uri.encode(safeSeed)}/700/700"
+    }
+
+    Box(modifier = modifier) {
+        val urlToShow = resolvedUrl
+        if (urlToShow != null) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(urlToShow)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = query,
+                contentScale = contentScale,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }
 
@@ -263,22 +498,22 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
     val navController = rememberNavController()
 
     val currentRoute = navController.currentBackStackEntryFlow.collectAsState(initial = null).value?.destination?.route
-    val backgroundSeed = when {
-        currentRoute?.startsWith("cooking") == true -> "cookingphase"
-        currentRoute == "home" -> "kitcheninterior"
-        currentRoute == "splash" -> "warmkitchen"
-        currentRoute == "add_recipe" -> "freshingredients"
-        else -> "fooddark"
+    val backgroundThemes = remember {
+        listOf(
+            "cozy kitchen interior",
+            "gourmet food photography",
+            "chinese cuisine dishes",
+            "malay food dishes",
+            "restaurant interior design",
+            "cafe aesthetic coffee"
+        )
     }
+    val backgroundQuery = remember(currentRoute) { backgroundThemes.random() }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data("https://picsum.photos/seed/$backgroundSeed/1080/1920")
-                .crossfade(true)
-                .build(),
-            contentDescription = "Background",
-            contentScale = ContentScale.Crop,
+        SmartImage(
+            query = backgroundQuery,
+            fallbackSeed = backgroundQuery,
             modifier = Modifier.fillMaxSize()
         )
         Box(
@@ -288,10 +523,16 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
         )
         DecorativeBackground()
 
-        NavHost(navController = navController, startDestination = "splash") {
-            composable("splash") { SplashScreen(navController) }
+        NavHost(navController = navController, startDestination = "welcome") {
+            composable("welcome") { WelcomeScreen(navController, viewModel) }
             composable("home") { HomeScreen(navController, viewModel) }
-            composable("add_recipe") { AddRecipeScreen(navController, viewModel) }
+            composable("add_recipe") { RecipeFormScreen(navController, viewModel, existingRecipe = null) }
+            composable("edit_recipe/{id}") { backStackEntry ->
+                val id = backStackEntry.arguments?.getString("id")
+                val recipe = viewModel.recipes.value.find { it.id == id }
+                RecipeFormScreen(navController, viewModel, existingRecipe = recipe)
+            }
+            composable("settings") { SettingsScreen(navController, viewModel) }
             composable("recipe/{id}") { backStackEntry ->
                 val id = backStackEntry.arguments?.getString("id")
                 val recipe = viewModel.recipes.value.find { it.id == id }
@@ -310,7 +551,7 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
                 val id = backStackEntry.arguments?.getString("id")
                 val recipe = viewModel.recipes.value.find { it.id == id }
                 if (recipe != null) {
-                    Phase2CookingScreen(navController, recipe, viewModel.completionMessages)
+                    Phase2CookingScreen(navController, recipe, viewModel)
                 }
             }
         }
@@ -318,49 +559,140 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 }
 
 // ============================================================================
-// SPLASH SCREEN
+// WELCOME SCREEN (name capture + animated greeting)
 // ============================================================================
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SplashScreen(navController: NavController) {
-    val greetings = remember {
-        listOf(
-            "Good to see you, Yan. What shall we cook today?",
-            "Welcome back, Yan — the kitchen has been waiting for you.",
-            "Hello, Yan. Let's create something wonderful together.",
-            "It's always a pleasure, Yan. Ready when you are.",
-            "Yan, your next delicious creation awaits."
-        )
-    }
-    val message = remember { greetings.random() }
+fun WelcomeScreen(navController: NavController, viewModel: RecipeViewModel) {
+    val savedName by viewModel.userName.collectAsState()
+    var nameInput by remember { mutableStateOf("") }
+    var hasSubmitted by remember { mutableStateOf(savedName.isNotBlank()) }
 
-    LaunchedEffect(Unit) {
-        delay(2200)
-        navController.navigate("home") {
-            popUpTo("splash") { inclusive = true }
+    val displayTitle = if (savedName.isBlank()) "Chef" else "Chef, $savedName"
+
+    val greetingMessage = remember(displayTitle, hasSubmitted) {
+        listOf(
+            "Good to see you, $displayTitle. What shall we cook today?",
+            "Welcome back, $displayTitle — the kitchen has been waiting for you.",
+            "Hello, $displayTitle. Let's create something wonderful together.",
+            "It's always a pleasure, $displayTitle. Ready when you are.",
+            "$displayTitle, your next delicious creation awaits."
+        ).random()
+    }
+
+    LaunchedEffect(hasSubmitted) {
+        if (hasSubmitted) {
+            delay(2200)
+            navController.navigate("home") {
+                popUpTo("welcome") { inclusive = true }
+            }
         }
     }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "welcome_anim")
+    val bounce by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = -18f,
+        animationSpec = infiniteRepeatable(tween(900, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Reverse),
+        label = "bounce"
+    )
+    val rotate by infiniteTransition.animateFloat(
+        initialValue = -8f,
+        targetValue = 8f,
+        animationSpec = infiniteRepeatable(tween(1400, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Reverse),
+        label = "rotate"
+    )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.background)
+                    listOf(Color(0xFFFFA45B), Color(0xFFFF6B9D), Color(0xFF6B5BFF))
                 )
-            ),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
-            Text("🍲", fontSize = 56.sp)
-            Spacer(modifier = Modifier.height(20.dp))
-            Text(
-                message,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                color = Color.White,
-                textAlign = TextAlign.Center
             )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("🍰", "🌈", "🍜", "🍧").forEachIndexed { i, emoji ->
+                    val direction = if (i % 2 == 0) 1f else -1f
+                    Text(
+                        emoji,
+                        fontSize = 44.sp,
+                        modifier = Modifier
+                            .offset(y = (bounce * direction).dp)
+                            .graphicsLayer { rotationZ = rotate * direction }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            if (!hasSubmitted) {
+                Text(
+                    "Welcome! What should we call you?",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+
+                OutlinedTextField(
+                    value = nameInput,
+                    onValueChange = { nameInput = it },
+                    placeholder = { Text("Your name (optional)", color = Color.White.copy(alpha = 0.6f)) },
+                    singleLine = true,
+                    textStyle = LocalTextStyle.current.copy(color = Color.White),
+                    colors = TextFieldDefaults.outlinedTextFieldColors(
+                        containerColor = Color.White.copy(alpha = 0.15f),
+                        focusedBorderColor = Color.White,
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.6f),
+                        cursorColor = Color.White
+                    ),
+                    modifier = Modifier.fillMaxWidth(0.85f)
+                )
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Button(
+                    onClick = {
+                        viewModel.setUserName(nameInput.trim())
+                        hasSubmitted = true
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFFFF6B9D)),
+                    modifier = Modifier
+                        .fillMaxWidth(0.85f)
+                        .height(52.dp)
+                ) {
+                    Text(
+                        if (nameInput.isBlank()) "Continue as Guest" else "Continue",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    "Sign-in with Google is coming soon.",
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.7f)
+                )
+            } else {
+                Text(
+                    greetingMessage,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
+                )
+            }
         }
     }
 }
@@ -454,7 +786,11 @@ fun HomeScreen(navController: NavController, viewModel: RecipeViewModel) {
             modifier = Modifier.fillMaxSize()
         ) {
             item {
-                HomeHeader(searchQuery) { viewModel.updateSearch(it) }
+                HomeHeader(
+                    searchQuery = searchQuery,
+                    onSearchChange = { viewModel.updateSearch(it) },
+                    onSettingsClick = { navController.navigate("settings") }
+                )
             }
 
             item {
@@ -528,14 +864,24 @@ fun HomeScreen(navController: NavController, viewModel: RecipeViewModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeHeader(searchQuery: String, onSearchChange: (String) -> Unit) {
+fun HomeHeader(searchQuery: String, onSearchChange: (String) -> Unit, onSettingsClick: () -> Unit) {
     Column(modifier = Modifier.padding(16.dp)) {
-        Text(
-            text = "What would you like to cook today?",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.ExtraBold,
-            color = MaterialTheme.colorScheme.onSurface
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "What would you like to cook today?",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.ExtraBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = onSettingsClick) {
+                Icon(Icons.Default.Settings, contentDescription = "Settings")
+            }
+        }
         Spacer(modifier = Modifier.height(16.dp))
         OutlinedTextField(
             value = searchQuery,
@@ -667,13 +1013,9 @@ fun RecipeCard(
     ) {
         Column {
             Box {
-                AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(recipe.imageUrl)
-                        .crossfade(true)
-                        .build(),
-                    contentDescription = recipe.name,
-                    contentScale = ContentScale.Crop,
+                SmartImage(
+                    query = recipe.name,
+                    fallbackSeed = recipe.name,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(140.dp)
@@ -739,10 +1081,9 @@ fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: 
         LazyColumn(contentPadding = padding) {
             item {
                 Box {
-                    AsyncImage(
-                        model = recipe.imageUrl,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
+                    SmartImage(
+                        query = recipe.name,
+                        fallbackSeed = recipe.name,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(300.dp)
@@ -754,6 +1095,15 @@ fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: 
                             .background(Color.White.copy(alpha = 0.5f), CircleShape)
                     ) {
                         Icon(Icons.Default.ArrowBack, "Back")
+                    }
+                    IconButton(
+                        onClick = { navController.navigate("edit_recipe/${recipe.id}") },
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(16.dp)
+                            .background(Color.White.copy(alpha = 0.5f), CircleShape)
+                    ) {
+                        Icon(Icons.Default.Edit, contentDescription = "Edit recipe")
                     }
                 }
             }
@@ -808,7 +1158,7 @@ fun StatBox(icon: ImageVector, label: String, value: String) {
 }
 
 // ============================================================================
-// ADD RECIPE SCREEN
+// RECIPE FORM SCREEN (Create AND Edit)
 // ============================================================================
 
 class IngredientFormRow(name: String = "", quantity: String = "") {
@@ -821,20 +1171,39 @@ class StepFormRow(text: String = "") {
 }
 
 @Composable
-fun AddRecipeScreen(navController: NavController, viewModel: RecipeViewModel) {
+fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, existingRecipe: Recipe?) {
     val categories by viewModel.categories.collectAsState()
     val selectableCategories = categories.filter { it != "All" }
+    val isEditing = existingRecipe != null
 
-    var name by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableStateOf(selectableCategories.firstOrNull() ?: "Dinner") }
+    var name by remember { mutableStateOf(existingRecipe?.name ?: "") }
+    var selectedCategory by remember {
+        mutableStateOf(existingRecipe?.category ?: selectableCategories.firstOrNull() ?: "Dinner")
+    }
     var newCategoryText by remember { mutableStateOf("") }
-    var prepTime by remember { mutableStateOf("10") }
-    var cookTime by remember { mutableStateOf("15") }
-    var servings by remember { mutableStateOf("2") }
-    var difficulty by remember { mutableStateOf("Easy") }
+    var prepTime by remember { mutableStateOf((existingRecipe?.prepTime ?: 10).toString()) }
+    var cookTime by remember { mutableStateOf((existingRecipe?.cookTime ?: 15).toString()) }
+    var servings by remember { mutableStateOf((existingRecipe?.servings ?: 2).toString()) }
+    var difficulty by remember { mutableStateOf(existingRecipe?.difficulty ?: "Easy") }
 
-    val ingredientRows = remember { mutableStateListOf(IngredientFormRow()) }
-    val stepRows = remember { mutableStateListOf(StepFormRow()) }
+    val ingredientRows = remember {
+        mutableStateListOf<IngredientFormRow>().apply {
+            if (existingRecipe != null && existingRecipe.ingredients.isNotEmpty()) {
+                existingRecipe.ingredients.forEach { add(IngredientFormRow(it.name, it.quantity)) }
+            } else {
+                add(IngredientFormRow())
+            }
+        }
+    }
+    val stepRows = remember {
+        mutableStateListOf<StepFormRow>().apply {
+            if (existingRecipe != null && existingRecipe.steps.isNotEmpty()) {
+                existingRecipe.steps.forEach { add(StepFormRow(it)) }
+            } else {
+                add(StepFormRow())
+            }
+        }
+    }
 
     Scaffold(containerColor = Color.Transparent) { padding ->
         LazyColumn(
@@ -849,7 +1218,11 @@ fun AddRecipeScreen(navController: NavController, viewModel: RecipeViewModel) {
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Back")
                     }
-                    Text("New Recipe", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Text(
+                        if (isEditing) "Edit Recipe" else "New Recipe",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -1024,20 +1397,36 @@ fun AddRecipeScreen(navController: NavController, viewModel: RecipeViewModel) {
                             .filter { it.isNotBlank() }
 
                         if (name.isNotBlank() && finalIngredients.isNotEmpty() && finalSteps.isNotEmpty()) {
-                            val newRecipe = Recipe(
-                                id = "recipe_${System.currentTimeMillis()}",
-                                name = name.trim(),
-                                cuisine = selectedCategory,
-                                category = selectedCategory,
-                                prepTime = prepTime.toIntOrNull() ?: 10,
-                                cookTime = cookTime.toIntOrNull() ?: 15,
-                                servings = servings.toIntOrNull() ?: 2,
-                                difficulty = difficulty,
-                                imageUrl = "https://picsum.photos/seed/${Uri.encode(name.trim().filter { it.isLetterOrDigit() }.ifEmpty { "recipe" })}/800/600",
-                                ingredients = finalIngredients,
-                                steps = finalSteps
-                            )
-                            viewModel.addRecipe(newRecipe)
+                            val safeSeed = name.trim().filter { it.isLetterOrDigit() }.ifEmpty { "recipe" }
+                            if (isEditing && existingRecipe != null) {
+                                val updated = existingRecipe.copy(
+                                    name = name.trim(),
+                                    cuisine = selectedCategory,
+                                    category = selectedCategory,
+                                    prepTime = prepTime.toIntOrNull() ?: 10,
+                                    cookTime = cookTime.toIntOrNull() ?: 15,
+                                    servings = servings.toIntOrNull() ?: 2,
+                                    difficulty = difficulty,
+                                    ingredients = finalIngredients,
+                                    steps = finalSteps
+                                )
+                                viewModel.updateRecipe(updated)
+                            } else {
+                                val newRecipe = Recipe(
+                                    id = "recipe_${System.currentTimeMillis()}",
+                                    name = name.trim(),
+                                    cuisine = selectedCategory,
+                                    category = selectedCategory,
+                                    prepTime = prepTime.toIntOrNull() ?: 10,
+                                    cookTime = cookTime.toIntOrNull() ?: 15,
+                                    servings = servings.toIntOrNull() ?: 2,
+                                    difficulty = difficulty,
+                                    imageUrl = "https://picsum.photos/seed/${Uri.encode(safeSeed)}/800/600",
+                                    ingredients = finalIngredients,
+                                    steps = finalSteps
+                                )
+                                viewModel.addRecipe(newRecipe)
+                            }
                             navController.popBackStack()
                         }
                     },
@@ -1047,9 +1436,74 @@ fun AddRecipeScreen(navController: NavController, viewModel: RecipeViewModel) {
                     shape = RoundedCornerShape(20.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                 ) {
-                    Text("Save Recipe", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text(if (isEditing) "Save Changes" else "Save Recipe", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 }
                 Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SETTINGS SCREEN
+// ============================================================================
+
+@Composable
+fun SettingsScreen(navController: NavController, viewModel: RecipeViewModel) {
+    val selectedSound by viewModel.selectedTimerSound.collectAsState()
+    val userName by viewModel.userName.collectAsState()
+    var nameEdit by remember(userName) { mutableStateOf(userName) }
+
+    Scaffold(containerColor = Color.Transparent) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 20.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 16.dp)) {
+                IconButton(onClick = { navController.popBackStack() }) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                }
+                Text("Settings", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            }
+
+            Text("Your name", fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = nameEdit,
+                    onValueChange = { nameEdit = it },
+                    placeholder = { Text("Chef") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                TextButton(onClick = { viewModel.setUserName(nameEdit.trim()) }) { Text("Save") }
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+            Text("Timer alarm sound", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            TimerSound.values().forEach { sound ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { viewModel.setTimerSound(sound) }
+                        .padding(vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = sound == selectedSound,
+                        onClick = { viewModel.setTimerSound(sound) }
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(sound.label, modifier = Modifier.weight(1f))
+                    TextButton(onClick = { playTimerBeep(sound) }) {
+                        Text("Preview")
+                    }
+                }
             }
         }
     }
@@ -1138,10 +1592,15 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
     val currentIngredient = recipe.ingredients[currentIndex]
 
     Column(modifier = Modifier.fillMaxSize()) {
+        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+            }
+        }
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(24.dp),
+                .padding(horizontal = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("Gather Ingredients", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -1156,7 +1615,7 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.ExtraBold,
                 fontSize = 12.sp,
-                modifier = Modifier.padding(top = 8.dp)
+                modifier = Modifier.padding(top = 8.dp, bottom = 16.dp)
             )
         }
 
@@ -1175,11 +1634,19 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
                 }
             ) {
                 Column(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text("🍋", fontSize = 48.sp)
+                    SmartImage(
+                        query = currentIngredient.name,
+                        fallbackSeed = currentIngredient.name,
+                        modifier = Modifier
+                            .size(120.dp)
+                            .clip(RoundedCornerShape(20.dp))
+                    )
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
                         text = currentIngredient.name,
@@ -1235,43 +1702,30 @@ fun Phase1GatherScreen(navController: NavController, recipe: Recipe) {
 // ============================================================================
 
 @Composable
-fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completionMessages: List<String>) {
+fun Phase2CookingScreen(navController: NavController, recipe: Recipe, viewModel: RecipeViewModel) {
     var currentStepIndex by remember { mutableStateOf(0) }
     val context = LocalContext.current
 
     if (currentStepIndex >= recipe.steps.size) {
-        val message = remember { completionMessages.random() }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.secondary),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text("🎉", fontSize = 80.sp)
-            Spacer(modifier = Modifier.height(24.dp))
-            Text("Dish Complete!", style = MaterialTheme.typography.headlineLarge, color = Color.White, fontWeight = FontWeight.ExtraBold)
-            Text(message, style = MaterialTheme.typography.titleMedium, color = Color.White.copy(alpha = 0.9f), textAlign = TextAlign.Center, modifier = Modifier.padding(32.dp))
-
-            Button(
-                onClick = { navController.navigate("home") { popUpTo(0) } },
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = MaterialTheme.colorScheme.secondary),
-                modifier = Modifier.padding(top = 32.dp).height(56.dp)
-            ) {
-                Text("Cook Another Dish", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            }
-        }
+        val message = remember { viewModel.completionMessages.random() }
+        DishCompleteScreen(navController = navController, message = message)
         return
     }
 
     val stepText = recipe.steps[currentStepIndex]
     val detectedSeconds = extractTimeInSeconds(stepText)
+    val selectedTimerSound by viewModel.selectedTimerSound.collectAsState()
 
     Column(modifier = Modifier.fillMaxSize()) {
+        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+            }
+        }
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(24.dp),
+                .padding(horizontal = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("Cooking Steps", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -1281,7 +1735,7 @@ fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completion
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.ExtraBold,
                 fontSize = 12.sp,
-                modifier = Modifier.padding(top = 8.dp)
+                modifier = Modifier.padding(top = 8.dp, bottom = 16.dp)
             )
         }
 
@@ -1324,7 +1778,7 @@ fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completion
 
                     if (detectedSeconds > 0) {
                         Spacer(modifier = Modifier.weight(1f))
-                        TimerWidget(seconds = detectedSeconds)
+                        TimerWidget(seconds = detectedSeconds, timerSound = selectedTimerSound)
                     }
                 }
             }
@@ -1334,7 +1788,67 @@ fun Phase2CookingScreen(navController: NavController, recipe: Recipe, completion
 }
 
 @Composable
-fun TimerWidget(seconds: Int) {
+fun DishCompleteScreen(navController: NavController, message: String) {
+    var scale by remember { mutableStateOf(0.3f) }
+    val animatedScale by animateFloatAsState(
+        targetValue = scale,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+        label = "dish_complete_scale"
+    )
+    LaunchedEffect(Unit) { scale = 1f }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.linearGradient(
+                    colors = listOf(
+                        Color(0xFFFF6B6B),
+                        Color(0xFFFFD93D),
+                        Color(0xFF6BCB77),
+                        Color(0xFF4D96FF)
+                    )
+                )
+            )
+    ) {
+        Text("🎊", fontSize = 34.sp, modifier = Modifier.align(Alignment.TopStart).padding(24.dp).graphicsLayer { rotationZ = -15f })
+        Text("✨", fontSize = 28.sp, modifier = Modifier.align(Alignment.TopEnd).padding(32.dp))
+        Text("🎈", fontSize = 30.sp, modifier = Modifier.align(Alignment.BottomStart).padding(28.dp).graphicsLayer { rotationZ = 10f })
+        Text("🎉", fontSize = 36.sp, modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp).graphicsLayer { rotationZ = -8f })
+        Text("⭐", fontSize = 24.sp, modifier = Modifier.align(Alignment.CenterStart).padding(16.dp))
+        Text("🍾", fontSize = 26.sp, modifier = Modifier.align(Alignment.CenterEnd).padding(16.dp).graphicsLayer { rotationZ = 12f })
+
+        Column(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .fillMaxWidth(0.85f)
+                .graphicsLayer { scaleX = animatedScale; scaleY = animatedScale }
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("🎉", fontSize = 80.sp)
+            Spacer(modifier = Modifier.height(24.dp))
+            Text("Dish Complete!", style = MaterialTheme.typography.headlineLarge, color = Color.White, fontWeight = FontWeight.ExtraBold)
+            Text(
+                message,
+                style = MaterialTheme.typography.titleMedium,
+                color = Color.White.copy(alpha = 0.95f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 16.dp, bottom = 16.dp)
+            )
+            Button(
+                onClick = { navController.navigate("home") { popUpTo(0) } },
+                colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFFFF6B6B)),
+                modifier = Modifier.height(56.dp)
+            ) {
+                Text("Cook Another Dish", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun TimerWidget(seconds: Int, timerSound: TimerSound) {
     var timeRemaining by remember { mutableStateOf(seconds) }
     var isRunning by remember { mutableStateOf(false) }
 
@@ -1363,7 +1877,7 @@ fun TimerWidget(seconds: Int) {
             isRunning = false
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
             repeat(3) {
-                playTimerBeep()
+                playTimerBeep(timerSound)
                 delay(350)
             }
             showTimerFinishedNotification(context)
@@ -1457,7 +1971,6 @@ fun SwipeableCard(
                                 offsetY.animateTo(-screenHeight, tween(300, easing = FastOutLinearInEasing))
                                 onSwipedUp()
                             } else if (swipeDownEnabled && offsetY.value > swipeThreshold) {
-                                // Swipe DOWN — shrinks and fades toward the basket below
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 launch { rotateZ.animateTo(-20f, tween(350)) }
                                 launch { scale.animateTo(0.1f, tween(350, easing = FastOutLinearInEasing)) }
@@ -1489,59 +2002,62 @@ fun SwipeableCard(
 }
 
 // ============================================================================
-// MOCK DATA GENERATOR
+// MOCK DATA GENERATOR (default recipes — fully editable via Edit screen)
 // ============================================================================
 
 fun getMockRecipes(): List<Recipe> {
     return listOf(
         Recipe(
             id = "1",
-            name = "Creamy Mashed Potatoes",
-            cuisine = "American",
-            category = "Side Dish",
-            prepTime = 10,
-            cookTime = 15,
-            servings = 4,
+            name = "Mango Lassi",
+            cuisine = "Drinks",
+            category = "Drinks",
+            prepTime = 5,
+            cookTime = 0,
+            servings = 2,
             difficulty = "Easy",
-            imageUrl = "https://images.unsplash.com/photo-1518977676601-b53f82aba655?q=80&w=800",
+            imageUrl = "https://picsum.photos/seed/mangolassi/800/600",
             ingredients = listOf(
-                Ingredient("Large Potatoes", "4 pcs"),
-                Ingredient("Whole Milk", "1/2 cup"),
-                Ingredient("Butter", "4 tbsp"),
-                Ingredient("Salt & Pepper", "to taste")
+                Ingredient("Ripe Mangoes", "2 pcs"),
+                Ingredient("Plain Yogurt", "1 cup"),
+                Ingredient("Milk", "1/2 cup"),
+                Ingredient("Sugar", "2 tbsp"),
+                Ingredient("Cardamom Powder", "a pinch")
             ),
             steps = listOf(
-                "Wash and peel the potatoes thoroughly.",
-                "Boil the potatoes for 15 minutes until soft.",
-                "Mash the potatoes while they are hot. Tip: Use a ricer for a smoother texture.",
-                "Stir in milk and butter. Let it sit for 2 mins to absorb flavors.",
-                "Season with salt and pepper to taste."
+                "Peel and chop the mangoes into chunks.",
+                "Add mango, yogurt, milk, and sugar to a blender.",
+                "Blend until smooth and creamy.",
+                "Add a pinch of cardamom powder and blend again briefly.",
+                "Pour into glasses and chill for 10 minutes before serving."
             )
         ),
         Recipe(
             id = "2",
-            name = "Garlic Herb Steak",
-            cuisine = "French",
-            category = "Dinner",
+            name = "Classic Banana Bread",
+            cuisine = "Dessert",
+            category = "Dessert",
             prepTime = 15,
-            cookTime = 10,
-            servings = 2,
-            difficulty = "Medium",
-            imageUrl = "https://images.unsplash.com/photo-1600891964092-4316c288032e?q=80&w=800",
+            cookTime = 60,
+            servings = 8,
+            difficulty = "Easy",
+            imageUrl = "https://picsum.photos/seed/bananabread/800/600",
             ingredients = listOf(
-                Ingredient("Ribeye Steak", "2 pcs"),
-                Ingredient("Garlic", "4 cloves"),
-                Ingredient("Rosemary", "2 sprigs"),
-                Ingredient("Butter", "3 tbsp")
+                Ingredient("Ripe Bananas", "3 pcs"),
+                Ingredient("All-Purpose Flour", "1 3/4 cup"),
+                Ingredient("Sugar", "3/4 cup"),
+                Ingredient("Butter", "1/3 cup"),
+                Ingredient("Eggs", "1 pc"),
+                Ingredient("Baking Soda", "1 tsp"),
+                Ingredient("Salt", "a pinch")
             ),
             steps = listOf(
-                "Let steak rest at room temp for 30 minutes.",
-                "Season generously with salt and pepper.",
-                "Sear in a very hot cast iron skillet for 3 minutes per side.",
-                "Add butter, garlic, and rosemary. Baste the steak for 2 minutes.",
-                "Rest the meat for 5 minutes before slicing."
-            ),
-            isFavorite = true
+                "Preheat the oven to 350°F (175°C) and grease a loaf pan.",
+                "Mash the ripe bananas in a large bowl.",
+                "Mix in melted butter, sugar, egg, and vanilla.",
+                "Sprinkle baking soda and salt over the mixture, then stir in the flour.",
+                "Pour the batter into the loaf pan and bake for 60 minutes until golden."
+            )
         )
     )
 }
