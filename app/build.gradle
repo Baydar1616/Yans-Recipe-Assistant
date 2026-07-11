@@ -13,6 +13,7 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+        buildConfigField "String", "UNSPLASH_ACCESS_KEY", "\"${System.getenv('UNSPLASH_ACCESS_KEY') ?: ''}\""
     }
 
     compileOptions {
@@ -26,6 +27,7 @@ android {
 
     buildFeatures {
         compose true
+        buildConfig true
     }
 
     composeOptions {
