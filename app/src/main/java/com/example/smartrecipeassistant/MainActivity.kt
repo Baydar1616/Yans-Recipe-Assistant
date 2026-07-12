@@ -56,6 +56,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import androidx.navigation.compose.*
@@ -236,6 +237,63 @@ fun jsonToStringList(json: String): List<String> {
 }
 
 // ============================================================================
+// IMAGE CACHING MODELS & RATE LIMITING (SRS v1.1)
+// ============================================================================
+
+data class CachedImage(val url: String, val fetchTime: Long)
+
+object UnsplashRateLimiter {
+    private const val MAX_CALLS_PER_HOUR = 50
+    private const val WINDOW_MS = 60 * 60 * 1000L
+    private val callTimestamps = mutableListOf<Long>()
+
+    @Synchronized
+    fun tryAcquire(): Boolean {
+        val now = System.currentTimeMillis()
+        callTimestamps.removeAll { now - it > WINDOW_MS }
+        return if (callTimestamps.size < MAX_CALLS_PER_HOUR) {
+            callTimestamps.add(now)
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fun homeImagesToJson(urls: List<String>): String {
+    val array = JSONArray()
+    urls.forEach { array.put(it) }
+    return array.toString()
+}
+
+fun jsonToHomeImagesList(json: String): List<String> {
+    val array = JSONArray(json)
+    return (0 until array.length()).map { array.getString(it) }
+}
+
+fun recipeImageCacheToJson(cache: Map<String, CachedImage>): String {
+    val obj = JSONObject()
+    cache.forEach { (id, cached) ->
+        val entry = JSONObject()
+        entry.put("url", cached.url)
+        entry.put("fetchTime", cached.fetchTime)
+        obj.put(id, entry)
+    }
+    return obj.toString()
+}
+
+fun jsonToRecipeImageCache(json: String): Map<String, CachedImage> {
+    val obj = JSONObject(json)
+    val map = mutableMapOf<String, CachedImage>()
+    obj.keys().forEach { key ->
+        val entry = obj.getJSONObject(key)
+        map[key] = CachedImage(entry.getString("url"), entry.getLong("fetchTime"))
+    }
+    return map
+}
+
+
+// ============================================================================
 // TIMER SOUND OPTIONS
 // ============================================================================
 
@@ -255,6 +313,21 @@ private const val KEY_RECIPES = "recipes_json"
 private const val KEY_CATEGORIES = "categories_json"
 private const val KEY_USER_NAME = "user_name"
 private const val KEY_TIMER_SOUND = "timer_sound"
+private const val KEY_HOME_IMAGES = "home_images_json"
+private const val KEY_HOME_IMAGES_FETCH_TIME = "home_images_fetch_time"
+private const val KEY_RECIPE_IMAGES = "recipe_images_json"
+private const val KEY_REFRESH_INTERVAL = "refresh_interval_minutes"
+private const val KEY_MANUAL_REFRESH_TIME = "manual_refresh_time"
+private const val KEY_WELCOME_BG_URL = "welcome_bg_url"
+private const val KEY_WELCOME_BG_TIME = "welcome_bg_time"
+
+private val HOME_IMAGE_THEMES = listOf(
+    "strawberry cake on wooden table",
+    "coffee on wooden table",
+    "Malaysian dishes"
+)
+private const val HOME_FETCH_COOLDOWN_MS = 60 * 60 * 1000L
+private const val WELCOME_BG_COOLDOWN_MS = 24 * 60 * 60 * 1000L
 
 class RecipeViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -279,14 +352,32 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
     private val _pantry = MutableStateFlow(listOf("Salt", "Pepper", "Olive Oil", "Milk"))
     val pantry: StateFlow<List<String>> = _pantry.asStateFlow()
 
+    private val _homeImages = MutableStateFlow(loadHomeImages())
+    val homeImages: StateFlow<List<String>> = _homeImages.asStateFlow()
+    private var lastHomeFetchTime: Long = prefs.getLong(KEY_HOME_IMAGES_FETCH_TIME, 0L)
+
+    private val _recipeImageCache = MutableStateFlow(loadRecipeImageCache())
+    val recipeImageCache: StateFlow<Map<String, CachedImage>> = _recipeImageCache.asStateFlow()
+
+    private val _refreshIntervalMinutes = MutableStateFlow(prefs.getInt(KEY_REFRESH_INTERVAL, 60))
+    val refreshIntervalMinutes: StateFlow<Int> = _refreshIntervalMinutes.asStateFlow()
+
+    private val _lastManualRefreshTime = MutableStateFlow(prefs.getLong(KEY_MANUAL_REFRESH_TIME, 0L))
+    val lastManualRefreshTime: StateFlow<Long> = _lastManualRefreshTime.asStateFlow()
+
+    private val _welcomeBackgroundUrl = MutableStateFlow(prefs.getString(KEY_WELCOME_BG_URL, null))
+    val welcomeBackgroundUrl: StateFlow<String?> = _welcomeBackgroundUrl.asStateFlow()
+    private var welcomeBackgroundFetchTime: Long = prefs.getLong(KEY_WELCOME_BG_TIME, 0L)
+
+    init {
+        fetchAndCacheHomeImages(force = false)
+        ensureWelcomeBackground()
+    }
+
     private fun loadRecipes(): List<Recipe> {
         val json = prefs.getString(KEY_RECIPES, null)
         return if (json != null) {
-            try {
-                jsonToRecipes(json)
-            } catch (e: Exception) {
-                getMockRecipes()
-            }
+            try { jsonToRecipes(json) } catch (e: Exception) { getMockRecipes() }
         } else {
             getMockRecipes()
         }
@@ -296,13 +387,27 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
         val json = prefs.getString(KEY_CATEGORIES, null)
         val defaults = listOf("All", "Breakfast", "Dinner", "Healthy", "Dessert", "Quick", "Drinks")
         return if (json != null) {
-            try {
-                jsonToStringList(json)
-            } catch (e: Exception) {
-                defaults
-            }
+            try { jsonToStringList(json) } catch (e: Exception) { defaults }
         } else {
             defaults
+        }
+    }
+
+    private fun loadHomeImages(): List<String> {
+        val json = prefs.getString(KEY_HOME_IMAGES, null)
+        return if (json != null) {
+            try { jsonToHomeImagesList(json) } catch (e: Exception) { emptyList() }
+        } else {
+            emptyList()
+        }
+    }
+
+    private fun loadRecipeImageCache(): Map<String, CachedImage> {
+        val json = prefs.getString(KEY_RECIPE_IMAGES, null)
+        return if (json != null) {
+            try { jsonToRecipeImageCache(json) } catch (e: Exception) { emptyMap() }
+        } else {
+            emptyMap()
         }
     }
 
@@ -312,6 +417,17 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun persistCategories() {
         prefs.edit().putString(KEY_CATEGORIES, stringListToJson(_categories.value)).apply()
+    }
+
+    private fun persistHomeImages() {
+        prefs.edit()
+            .putString(KEY_HOME_IMAGES, homeImagesToJson(_homeImages.value))
+            .putLong(KEY_HOME_IMAGES_FETCH_TIME, lastHomeFetchTime)
+            .apply()
+    }
+
+    private fun persistRecipeImageCache() {
+        prefs.edit().putString(KEY_RECIPE_IMAGES, recipeImageCacheToJson(_recipeImageCache.value)).apply()
     }
 
     fun updateSearch(query: String) {
@@ -333,6 +449,13 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
     fun updateRecipe(recipe: Recipe) {
         _recipes.value = _recipes.value.map { if (it.id == recipe.id) recipe else it }
         persistRecipes()
+    }
+
+    fun deleteRecipe(recipeId: String) {
+        _recipes.value = _recipes.value.filterNot { it.id == recipeId }
+        persistRecipes()
+        _recipeImageCache.value = _recipeImageCache.value - recipeId
+        persistRecipeImageCache()
     }
 
     fun addCategory(name: String) {
@@ -359,6 +482,71 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
         prefs.edit().putString(KEY_TIMER_SOUND, sound.name).apply()
     }
 
+    fun setRefreshInterval(minutes: Int) {
+        _refreshIntervalMinutes.value = minutes
+        prefs.edit().putInt(KEY_REFRESH_INTERVAL, minutes).apply()
+    }
+
+    fun fetchAndCacheHomeImages(force: Boolean) {
+        val now = System.currentTimeMillis()
+        val expired = now - lastHomeFetchTime >= HOME_FETCH_COOLDOWN_MS
+        if (!force && !expired && _homeImages.value.isNotEmpty()) return
+
+        viewModelScope.launch {
+            val newUrls = mutableListOf<String>()
+            for (theme in HOME_IMAGE_THEMES) {
+                val url = fetchUnsplashImageUrl(theme, BuildConfig.UNSPLASH_ACCESS_KEY)
+                if (url != null) newUrls.add(url)
+            }
+            if (newUrls.isNotEmpty()) {
+                _homeImages.value = newUrls
+                lastHomeFetchTime = now
+                persistHomeImages()
+            }
+        }
+    }
+
+    fun manualRefresh() {
+        val now = System.currentTimeMillis()
+        if (now - _lastManualRefreshTime.value < HOME_FETCH_COOLDOWN_MS) return
+        _lastManualRefreshTime.value = now
+        prefs.edit().putLong(KEY_MANUAL_REFRESH_TIME, now).apply()
+        fetchAndCacheHomeImages(force = true)
+    }
+
+    fun ensureRecipeImage(recipeId: String, recipeName: String) {
+        val now = System.currentTimeMillis()
+        val intervalMs = _refreshIntervalMinutes.value * 60_000L
+        val cached = _recipeImageCache.value[recipeId]
+        val isFresh = cached != null && (now - cached.fetchTime) < intervalMs
+        if (isFresh) return
+
+        viewModelScope.launch {
+            val url = fetchUnsplashImageUrl(recipeName, BuildConfig.UNSPLASH_ACCESS_KEY)
+            if (url != null) {
+                _recipeImageCache.value = _recipeImageCache.value + (recipeId to CachedImage(url, now))
+                persistRecipeImageCache()
+            }
+        }
+    }
+
+    fun ensureWelcomeBackground() {
+        val now = System.currentTimeMillis()
+        if (_welcomeBackgroundUrl.value != null && (now - welcomeBackgroundFetchTime) < WELCOME_BG_COOLDOWN_MS) return
+
+        viewModelScope.launch {
+            val url = fetchUnsplashImageUrl("delicious food background", BuildConfig.UNSPLASH_ACCESS_KEY)
+            if (url != null) {
+                _welcomeBackgroundUrl.value = url
+                welcomeBackgroundFetchTime = now
+                prefs.edit()
+                    .putString(KEY_WELCOME_BG_URL, url)
+                    .putLong(KEY_WELCOME_BG_TIME, now)
+                    .apply()
+            }
+        }
+    }
+
     val completionMessages = listOf(
         "Your kitchen must smell incredible right now.",
         "That aroma says dinner is almost ready.",
@@ -370,6 +558,7 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
         "Your family is going to love this."
     )
 }
+
 
 // ============================================================================
 // NOTIFICATION & SOUND HELPERS (for the cooking timer)
@@ -429,7 +618,9 @@ fun playTimerBeep(sound: TimerSound) {
 
 suspend fun fetchUnsplashImageUrl(query: String, accessKey: String): String? = withContext(Dispatchers.IO) {
     if (accessKey.isBlank()) return@withContext null
+    if (!UnsplashRateLimiter.tryAcquire()) return@withContext null
     try {
+
         val encodedQuery = Uri.encode(query)
         val url = URL("https://api.unsplash.com/search/photos?query=$encodedQuery&per_page=1&orientation=squarish&client_id=$accessKey")
         val connection = url.openConnection() as HttpURLConnection
@@ -463,11 +654,16 @@ fun SmartImage(
     query: String,
     fallbackSeed: String,
     modifier: Modifier = Modifier,
-    contentScale: ContentScale = ContentScale.Crop
+    contentScale: ContentScale = ContentScale.Crop,
+    cachedUrl: String? = null
 ) {
-    var resolvedUrl by remember(query) { mutableStateOf<String?>(null) }
+    var resolvedUrl by remember(query, cachedUrl) { mutableStateOf(cachedUrl) }
 
-    LaunchedEffect(query) {
+    LaunchedEffect(query, cachedUrl) {
+        if (cachedUrl != null) {
+            resolvedUrl = cachedUrl
+            return@LaunchedEffect
+        }
         val fetched = fetchUnsplashImageUrl(query, BuildConfig.UNSPLASH_ACCESS_KEY)
         val safeSeed = fallbackSeed.filter { it.isLetterOrDigit() }.ifEmpty { "food" }
         resolvedUrl = fetched ?: "https://picsum.photos/seed/${Uri.encode(safeSeed)}/700/700"
@@ -511,11 +707,15 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
     val backgroundQuery = remember(currentRoute) { backgroundThemes.random() }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        SmartImage(
-            query = backgroundQuery,
-            fallbackSeed = backgroundQuery,
-            modifier = Modifier.fillMaxSize()
-        )
+        if (currentRoute == "home") {
+            HomeBackgroundCycler(viewModel = viewModel)
+        } else {
+            SmartImage(
+                query = backgroundQuery,
+                fallbackSeed = backgroundQuery,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -525,7 +725,10 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 
         NavHost(navController = navController, startDestination = "welcome") {
             composable("welcome") { WelcomeScreen(navController, viewModel) }
-            composable("home") { HomeScreen(navController, viewModel) }
+            composable(
+                "home",
+                exitTransition = { fadeOut(animationSpec = tween(250)) }
+            ) { HomeScreen(navController, viewModel) }
             composable("add_recipe") { RecipeFormScreen(navController, viewModel, existingRecipe = null) }
             composable("edit_recipe/{id}") { backStackEntry ->
                 val id = backStackEntry.arguments?.getString("id")
@@ -533,7 +736,18 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
                 RecipeFormScreen(navController, viewModel, existingRecipe = recipe)
             }
             composable("settings") { SettingsScreen(navController, viewModel) }
-            composable("recipe/{id}") { backStackEntry ->
+            composable(
+                "recipe/{id}",
+                enterTransition = {
+                    scaleIn(
+                        initialScale = 0.85f,
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium)
+                    ) + fadeIn(animationSpec = tween(300))
+                },
+                popExitTransition = {
+                    scaleOut(targetScale = 0.85f, animationSpec = tween(250)) + fadeOut(animationSpec = tween(250))
+                }
+            ) { backStackEntry ->
                 val id = backStackEntry.arguments?.getString("id")
                 val recipe = viewModel.recipes.value.find { it.id == id }
                 if (recipe != null) {
@@ -559,6 +773,56 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 }
 
 // ============================================================================
+// HOME BACKGROUND CYCLER (FR-1 to FR-6)
+// ============================================================================
+
+@Composable
+fun HomeBackgroundCycler(viewModel: RecipeViewModel) {
+    val homeImages by viewModel.homeImages.collectAsState()
+    val refreshInterval by viewModel.refreshIntervalMinutes.collectAsState()
+
+    if (homeImages.isEmpty()) {
+        SmartImage(
+            query = "kitchen interior",
+            fallbackSeed = "kitchen interior",
+            modifier = Modifier.fillMaxSize()
+        )
+        return
+    }
+
+    var displayIndex by remember(homeImages) { mutableStateOf(0) }
+
+    LaunchedEffect(homeImages, refreshInterval) {
+        val segmentMs = (refreshInterval * 60_000L / homeImages.size).coerceAtLeast(5000L)
+        while (true) {
+            delay(segmentMs)
+            displayIndex = (displayIndex + 1) % homeImages.size
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(60_000L)
+            viewModel.fetchAndCacheHomeImages(force = false)
+        }
+    }
+
+    val currentUrl = homeImages[displayIndex.coerceIn(0, homeImages.size - 1)]
+
+    Crossfade(targetState = currentUrl, animationSpec = tween(500), label = "home_bg_crossfade") { url ->
+        AsyncImage(
+            model = ImageRequest.Builder(LocalContext.current)
+                .data(url)
+                .crossfade(true)
+                .build(),
+            contentDescription = "Home background",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize()
+        )
+    }
+}
+
+// ============================================================================
 // WELCOME SCREEN (name capture + animated greeting)
 // ============================================================================
 
@@ -566,6 +830,7 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 @Composable
 fun WelcomeScreen(navController: NavController, viewModel: RecipeViewModel) {
     val savedName by viewModel.userName.collectAsState()
+    val welcomeBackgroundUrl by viewModel.welcomeBackgroundUrl.collectAsState()
     var nameInput by remember { mutableStateOf("") }
     var hasSubmitted by remember { mutableStateOf(savedName.isNotBlank()) }
 
@@ -604,15 +869,36 @@ fun WelcomeScreen(navController: NavController, viewModel: RecipeViewModel) {
         label = "rotate"
     )
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFFFFA45B), Color(0xFFFF6B9D), Color(0xFF6B5BFF))
-                )
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (welcomeBackgroundUrl != null) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(welcomeBackgroundUrl)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
             )
-    ) {
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            Color(0xFFFFA45B).copy(alpha = 0.78f),
+                            Color(0xFFFF6B9D).copy(alpha = 0.78f),
+                            Color(0xFF6B5BFF).copy(alpha = 0.85f)
+                        )
+                    )
+                )
+        )
+
+        if (hasSubmitted) {
+            FloatingFoodItems()
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -696,6 +982,49 @@ fun WelcomeScreen(navController: NavController, viewModel: RecipeViewModel) {
         }
     }
 }
+
+@Composable
+fun FloatingFoodItems() {
+    val emojis = remember { listOf("🍓", "🎂", "☕", "🧊", "🥤", "🍰") }
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val screenHeightDp = maxHeight
+        val screenWidthDp = maxWidth
+        emojis.forEachIndexed { index, emoji ->
+            val infiniteTransition = rememberInfiniteTransition(label = "float_$index")
+            val durationMs = 6000 + index * 900
+            val progress by infiniteTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMs, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                ),
+                label = "progress_$index"
+            )
+            val drift by infiniteTransition.animateFloat(
+                initialValue = -1f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMs / 2, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "drift_$index"
+            )
+            val startXFraction = (index + 1f) / (emojis.size + 1f)
+            val yOffset = screenHeightDp * progress - 40.dp
+            val xOffset = screenWidthDp * startXFraction + (drift * 16).dp
+
+            Text(
+                text = emoji,
+                fontSize = 32.sp,
+                modifier = Modifier
+                    .offset(x = xOffset, y = yOffset)
+                    .graphicsLayer { alpha = 0.85f }
+            )
+        }
+    }
+}
+
 
 // ============================================================================
 // DECORATIVE BACKGROUND ACCENTS
@@ -1062,6 +1391,15 @@ fun RecipeCard(
 
 @Composable
 fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: RecipeViewModel) {
+    val recipeImageCache by viewModel.recipeImageCache.collectAsState()
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    LaunchedEffect(recipe.id) {
+        viewModel.ensureRecipeImage(recipe.id, recipe.name)
+    }
+
+    val cachedUrl = recipeImageCache[recipe.id]?.url
+
     Scaffold(
         bottomBar = {
             Button(
@@ -1084,6 +1422,7 @@ fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: 
                     SmartImage(
                         query = recipe.name,
                         fallbackSeed = recipe.name,
+                        cachedUrl = cachedUrl,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(300.dp)
@@ -1096,14 +1435,24 @@ fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: 
                     ) {
                         Icon(Icons.Default.ArrowBack, "Back")
                     }
-                    IconButton(
-                        onClick = { navController.navigate("edit_recipe/${recipe.id}") },
+                    Row(
                         modifier = Modifier
                             .align(Alignment.TopEnd)
                             .padding(16.dp)
-                            .background(Color.White.copy(alpha = 0.5f), CircleShape)
                     ) {
-                        Icon(Icons.Default.Edit, contentDescription = "Edit recipe")
+                        IconButton(
+                            onClick = { navController.navigate("edit_recipe/${recipe.id}") },
+                            modifier = Modifier.background(Color.White.copy(alpha = 0.5f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = "Edit recipe")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        IconButton(
+                            onClick = { showDeleteConfirm = true },
+                            modifier = Modifier.background(Color.White.copy(alpha = 0.5f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete recipe")
+                        }
                     }
                 }
             }
@@ -1145,6 +1494,24 @@ fun RecipeDetailScreen(navController: NavController, recipe: Recipe, viewModel: 
                 }
             }
         }
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete this recipe?") },
+            text = { Text("This can't be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.deleteRecipe(recipe.id)
+                    showDeleteConfirm = false
+                    navController.popBackStack()
+                }) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -1453,6 +1820,26 @@ fun SettingsScreen(navController: NavController, viewModel: RecipeViewModel) {
     val selectedSound by viewModel.selectedTimerSound.collectAsState()
     val userName by viewModel.userName.collectAsState()
     var nameEdit by remember(userName) { mutableStateOf(userName) }
+    val refreshInterval by viewModel.refreshIntervalMinutes.collectAsState()
+    val lastManualRefresh by viewModel.lastManualRefreshTime.collectAsState()
+
+    val intervalOptions = listOf(10, 15, 30, 45, 60)
+    var sliderPosition by remember(refreshInterval) {
+        mutableStateOf(intervalOptions.indexOf(refreshInterval).coerceAtLeast(0).toFloat())
+    }
+
+    var tick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            tick = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+    val cooldownMs = 60 * 60 * 1000L
+    val remainingMs = (cooldownMs - (tick - lastManualRefresh)).coerceAtLeast(0L)
+    val canRefreshNow = remainingMs <= 0L
+    val remainingMinutes = (remainingMs / 60000L).toInt()
+    val remainingSeconds = ((remainingMs / 1000L) % 60L).toInt()
 
     Scaffold(containerColor = Color.Transparent) { padding ->
         Column(
@@ -1505,6 +1892,44 @@ fun SettingsScreen(navController: NavController, viewModel: RecipeViewModel) {
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.height(28.dp))
+            Text("Image Settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "Refresh every ${intervalOptions[sliderPosition.roundToInt().coerceIn(0, intervalOptions.size - 1)]} minutes",
+                fontWeight = FontWeight.SemiBold
+            )
+            Slider(
+                value = sliderPosition,
+                onValueChange = { sliderPosition = it },
+                onValueChangeFinished = {
+                    val index = sliderPosition.roundToInt().coerceIn(0, intervalOptions.size - 1)
+                    viewModel.setRefreshInterval(intervalOptions[index])
+                },
+                valueRange = 0f..(intervalOptions.size - 1).toFloat(),
+                steps = intervalOptions.size - 2
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(
+                onClick = { viewModel.manualRefresh() },
+                enabled = canRefreshNow,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+            ) {
+                Text("Refresh Images Now", fontWeight = FontWeight.Bold)
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                if (canRefreshNow) "Ready to refresh." else "Next manual refresh available in ${remainingMinutes}m ${remainingSeconds}s",
+                fontSize = 12.sp,
+                color = Color.Gray
+            )
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
@@ -2061,3 +2486,4 @@ fun getMockRecipes(): List<Recipe> {
         )
     )
 }
+
