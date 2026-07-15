@@ -6,12 +6,14 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -62,6 +64,9 @@ import androidx.navigation.NavController
 import androidx.navigation.compose.*
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.example.smartrecipeassistant.data.ImageResult
+import com.example.smartrecipeassistant.data.ImageScoringRepository
+import com.example.smartrecipeassistant.data.SmartSearchState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -154,7 +159,7 @@ data class Ingredient(
 )
 
 // ============================================================================
-// JSON PERSISTENCE HELPERS (org.json — built into Android, no new dependency)
+// JSON PERSISTENCE HELPERS
 // ============================================================================
 
 fun recipeToJson(recipe: Recipe): JSONObject {
@@ -237,7 +242,7 @@ fun jsonToStringList(json: String): List<String> {
 }
 
 // ============================================================================
-// IMAGE CACHING MODELS & RATE LIMITING (SRS v1.1)
+// IMAGE CACHING MODELS & RATE LIMITING
 // ============================================================================
 
 data class CachedImage(val url: String, val fetchTime: Long)
@@ -292,7 +297,6 @@ fun jsonToRecipeImageCache(json: String): Map<String, CachedImage> {
     return map
 }
 
-
 // ============================================================================
 // TIMER SOUND OPTIONS
 // ============================================================================
@@ -301,7 +305,11 @@ enum class TimerSound(val label: String, val toneType: Int, val durationMs: Int)
     CLASSIC_BEEP("Classic Beep", ToneGenerator.TONE_PROP_BEEP, 200),
     ALERT_CHIME("Alert Chime", ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 250),
     SOFT_PING("Soft Ping", ToneGenerator.TONE_CDMA_ABBR_ALERT, 150),
-    URGENT_ALARM("Urgent Alarm", ToneGenerator.TONE_DTMF_1, 300)
+    URGENT_ALARM("Urgent Alarm", ToneGenerator.TONE_DTMF_1, 300),
+    QUICK_PIP("Quick Pip", ToneGenerator.TONE_CDMA_PIP, 150),
+    HIGH_PULSE("High Pulse", ToneGenerator.TONE_CDMA_HIGH_L, 300),
+    LONG_BEEP("Long Beep", ToneGenerator.TONE_CDMA_ONE_MIN_BEEP, 400),
+    RINGTONE_STYLE("Ringtone Style", ToneGenerator.TONE_SUP_RINGTONE, 500)
 }
 
 // ============================================================================
@@ -320,6 +328,7 @@ private const val KEY_REFRESH_INTERVAL = "refresh_interval_minutes"
 private const val KEY_MANUAL_REFRESH_TIME = "manual_refresh_time"
 private const val KEY_WELCOME_BG_URL = "welcome_bg_url"
 private const val KEY_WELCOME_BG_TIME = "welcome_bg_time"
+private const val KEY_KEEP_BG_COOKING = "keep_bg_during_cooking"
 
 private val HOME_IMAGE_THEMES = listOf(
     "strawberry cake on wooden table",
@@ -368,6 +377,12 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
     private val _welcomeBackgroundUrl = MutableStateFlow(prefs.getString(KEY_WELCOME_BG_URL, null))
     val welcomeBackgroundUrl: StateFlow<String?> = _welcomeBackgroundUrl.asStateFlow()
     private var welcomeBackgroundFetchTime: Long = prefs.getLong(KEY_WELCOME_BG_TIME, 0L)
+
+    private val _keepBackgroundDuringCooking = MutableStateFlow(prefs.getBoolean(KEY_KEEP_BG_COOKING, true))
+    val keepBackgroundDuringCooking: StateFlow<Boolean> = _keepBackgroundDuringCooking.asStateFlow()
+
+    private val _smartSearchState = MutableStateFlow<SmartSearchState>(SmartSearchState.Idle)
+    val smartSearchState: StateFlow<SmartSearchState> = _smartSearchState.asStateFlow()
 
     init {
         fetchAndCacheHomeImages(force = false)
@@ -487,6 +502,16 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
         prefs.edit().putInt(KEY_REFRESH_INTERVAL, minutes).apply()
     }
 
+    fun setKeepBackgroundDuringCooking(enabled: Boolean) {
+        _keepBackgroundDuringCooking.value = enabled
+        prefs.edit().putBoolean(KEY_KEEP_BG_COOKING, enabled).apply()
+    }
+
+    fun setRecipeImage(recipeId: String, url: String) {
+        _recipeImageCache.value = _recipeImageCache.value + (recipeId to CachedImage(url, System.currentTimeMillis()))
+        persistRecipeImageCache()
+    }
+
     fun fetchAndCacheHomeImages(force: Boolean) {
         val now = System.currentTimeMillis()
         val expired = now - lastHomeFetchTime >= HOME_FETCH_COOLDOWN_MS
@@ -547,6 +572,25 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun runSmartImageSearch(dishName: String) {
+        if (dishName.isBlank()) return
+        _smartSearchState.value = SmartSearchState.Loading
+        viewModelScope.launch {
+            when (val result = ImageScoringRepository.findBestImage(
+                dishName = dishName,
+                unsplashAccessKey = BuildConfig.UNSPLASH_ACCESS_KEY,
+                huggingFaceToken = BuildConfig.HUGGING_FACE_TOKEN
+            )) {
+                is ImageResult.Success -> _smartSearchState.value = SmartSearchState.Success(result.url, result.wasClipScored)
+                is ImageResult.Failure -> _smartSearchState.value = SmartSearchState.Error(result.reason)
+            }
+        }
+    }
+
+    fun resetSmartSearch() {
+        _smartSearchState.value = SmartSearchState.Idle
+    }
+
     val completionMessages = listOf(
         "Your kitchen must smell incredible right now.",
         "That aroma says dinner is almost ready.",
@@ -559,9 +603,8 @@ class RecipeViewModel(application: Application) : AndroidViewModel(application) 
     )
 }
 
-
 // ============================================================================
-// NOTIFICATION & SOUND HELPERS (for the cooking timer)
+// NOTIFICATION & SOUND HELPERS
 // ============================================================================
 
 private const val TIMER_CHANNEL_ID = "timer_channel"
@@ -620,7 +663,6 @@ suspend fun fetchUnsplashImageUrl(query: String, accessKey: String): String? = w
     if (accessKey.isBlank()) return@withContext null
     if (!UnsplashRateLimiter.tryAcquire()) return@withContext null
     try {
-
         val encodedQuery = Uri.encode(query)
         val url = URL("https://api.unsplash.com/search/photos?query=$encodedQuery&per_page=1&orientation=squarish&client_id=$accessKey")
         val connection = url.openConnection() as HttpURLConnection
@@ -705,9 +747,21 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
         )
     }
     val backgroundQuery = remember(currentRoute) { backgroundThemes.random() }
+    val keepBgDuringCooking by viewModel.keepBackgroundDuringCooking.collectAsState()
+    val isCookingRoute = currentRoute?.startsWith("cooking_phase") == true
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        if (currentRoute == "home") {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+    ) {
+        if (isCookingRoute && !keepBgDuringCooking) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+            )
+        } else if (currentRoute == "home") {
             HomeBackgroundCycler(viewModel = viewModel)
         } else {
             SmartImage(
@@ -773,7 +827,7 @@ fun SmartRecipeApp(viewModel: RecipeViewModel = viewModel()) {
 }
 
 // ============================================================================
-// HOME BACKGROUND CYCLER (FR-1 to FR-6)
+// HOME BACKGROUND CYCLER
 // ============================================================================
 
 @Composable
@@ -823,7 +877,7 @@ fun HomeBackgroundCycler(viewModel: RecipeViewModel) {
 }
 
 // ============================================================================
-// WELCOME SCREEN (name capture + animated greeting)
+// WELCOME SCREEN
 // ============================================================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1024,7 +1078,6 @@ fun FloatingFoodItems() {
         }
     }
 }
-
 
 // ============================================================================
 // DECORATIVE BACKGROUND ACCENTS
@@ -1285,7 +1338,11 @@ fun CategoryManagerDialog(
         onDismissRequest = onDismiss,
         title = { Text("Manage Categories") },
         text = {
-            Column {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .imePadding()
+            ) {
                 categories.filter { it != "All" }.forEach { cat ->
                     Row(
                         modifier = Modifier
@@ -1553,6 +1610,20 @@ fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, e
     var servings by remember { mutableStateOf((existingRecipe?.servings ?: 2).toString()) }
     var difficulty by remember { mutableStateOf(existingRecipe?.difficulty ?: "Easy") }
 
+    var chosenImageUrl by remember { mutableStateOf<String?>(null) }
+    val smartSearchState by viewModel.smartSearchState.collectAsState()
+
+    LaunchedEffect(Unit) {
+        viewModel.resetSmartSearch()
+    }
+
+    LaunchedEffect(smartSearchState) {
+        val state = smartSearchState
+        if (state is SmartSearchState.Success) {
+            chosenImageUrl = state.imageUrl
+        }
+    }
+
     val ingredientRows = remember {
         mutableStateListOf<IngredientFormRow>().apply {
             if (existingRecipe != null && existingRecipe.ingredients.isNotEmpty()) {
@@ -1577,6 +1648,7 @@ fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, e
             contentPadding = padding,
             modifier = Modifier
                 .fillMaxSize()
+                .imePadding()
                 .padding(horizontal = 20.dp)
         ) {
             item {
@@ -1599,6 +1671,48 @@ fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, e
                     label = { Text("Recipe name") },
                     modifier = Modifier.fillMaxWidth()
                 )
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = { viewModel.runSmartImageSearch(name) },
+                    enabled = name.isNotBlank() && smartSearchState !is SmartSearchState.Loading,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                ) {
+                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(if (smartSearchState is SmartSearchState.Loading) "Finding the best photo…" else "Find Best Photo (AI)")
+                }
+
+                when (val state = smartSearchState) {
+                    is SmartSearchState.Loading -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    is SmartSearchState.Success -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        AsyncImage(
+                            model = ImageRequest.Builder(LocalContext.current).data(state.imageUrl).crossfade(true).build(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(160.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                        )
+                        Text(
+                            if (state.wasClipScored) "✓ Picked by AI similarity scoring" else "Using Unsplash's top result (AI scoring unavailable)",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
+                    is SmartSearchState.Error -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Couldn't fetch a photo: ${state.message}", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    }
+                    SmartSearchState.Idle -> { }
+                }
+
                 Spacer(modifier = Modifier.height(16.dp))
 
                 Text("Category", fontWeight = FontWeight.SemiBold)
@@ -1765,7 +1879,9 @@ fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, e
 
                         if (name.isNotBlank() && finalIngredients.isNotEmpty() && finalSteps.isNotEmpty()) {
                             val safeSeed = name.trim().filter { it.isLetterOrDigit() }.ifEmpty { "recipe" }
+                            val recipeIdUsed: String
                             if (isEditing && existingRecipe != null) {
+                                recipeIdUsed = existingRecipe.id
                                 val updated = existingRecipe.copy(
                                     name = name.trim(),
                                     cuisine = selectedCategory,
@@ -1779,8 +1895,9 @@ fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, e
                                 )
                                 viewModel.updateRecipe(updated)
                             } else {
+                                recipeIdUsed = "recipe_${System.currentTimeMillis()}"
                                 val newRecipe = Recipe(
-                                    id = "recipe_${System.currentTimeMillis()}",
+                                    id = recipeIdUsed,
                                     name = name.trim(),
                                     cuisine = selectedCategory,
                                     category = selectedCategory,
@@ -1788,12 +1905,13 @@ fun RecipeFormScreen(navController: NavController, viewModel: RecipeViewModel, e
                                     cookTime = cookTime.toIntOrNull() ?: 15,
                                     servings = servings.toIntOrNull() ?: 2,
                                     difficulty = difficulty,
-                                    imageUrl = "https://picsum.photos/seed/${Uri.encode(safeSeed)}/800/600",
+                                    imageUrl = chosenImageUrl ?: "https://picsum.photos/seed/${Uri.encode(safeSeed)}/800/600",
                                     ingredients = finalIngredients,
                                     steps = finalSteps
                                 )
                                 viewModel.addRecipe(newRecipe)
                             }
+                            chosenImageUrl?.let { viewModel.setRecipeImage(recipeIdUsed, it) }
                             navController.popBackStack()
                         }
                     },
@@ -1822,6 +1940,9 @@ fun SettingsScreen(navController: NavController, viewModel: RecipeViewModel) {
     var nameEdit by remember(userName) { mutableStateOf(userName) }
     val refreshInterval by viewModel.refreshIntervalMinutes.collectAsState()
     val lastManualRefresh by viewModel.lastManualRefreshTime.collectAsState()
+    val keepBgDuringCooking by viewModel.keepBackgroundDuringCooking.collectAsState()
+    val context = LocalContext.current
+    val notificationsEnabled = remember { NotificationManagerCompat.from(context).areNotificationsEnabled() }
 
     val intervalOptions = listOf(10, 15, 30, 45, 60)
     var sliderPosition by remember(refreshInterval) {
@@ -1846,6 +1967,8 @@ fun SettingsScreen(navController: NavController, viewModel: RecipeViewModel) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .imePadding()
                 .padding(horizontal = 20.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 16.dp)) {
@@ -1929,6 +2052,54 @@ fun SettingsScreen(navController: NavController, viewModel: RecipeViewModel) {
                 fontSize = 12.sp,
                 color = Color.Gray
             )
+
+            Spacer(modifier = Modifier.height(28.dp))
+            Text("Cooking Screen", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Keep background visible while cooking", modifier = Modifier.weight(1f))
+                Switch(
+                    checked = keepBgDuringCooking,
+                    onCheckedChange = { viewModel.setKeepBackgroundDuringCooking(it) }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+            Text("Notifications", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                if (notificationsEnabled) "Status: Enabled ✅" else "Status: Disabled ❌ — tap below to fix",
+                color = if (notificationsEnabled) Color(0xFF10B981) else MaterialTheme.colorScheme.error,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    createTimerNotificationChannel(context)
+                    showTimerFinishedNotification(context)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+            ) {
+                Text("Send Test Notification")
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = {
+                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    }
+                    context.startActivity(intent)
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Open Notification Settings")
+            }
+
             Spacer(modifier = Modifier.height(24.dp))
         }
     }
@@ -2427,7 +2598,7 @@ fun SwipeableCard(
 }
 
 // ============================================================================
-// MOCK DATA GENERATOR (default recipes — fully editable via Edit screen)
+// MOCK DATA GENERATOR
 // ============================================================================
 
 fun getMockRecipes(): List<Recipe> {
@@ -2486,4 +2657,3 @@ fun getMockRecipes(): List<Recipe> {
         )
     )
 }
-
