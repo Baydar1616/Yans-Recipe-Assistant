@@ -1,2 +1,2 @@
 # Yans-Recipe-Assistant
-kt to apk
+Kotlin to APK conversion workflow
