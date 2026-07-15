@@ -27,6 +27,7 @@ jobs:
       - name: Build debug APK
         env:
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
+          HUGGING_FACE_TOKEN: ${{ secrets.HUGGING_FACE_TOKEN }}
         run: gradle assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK
